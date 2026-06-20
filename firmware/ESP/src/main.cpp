@@ -1,0 +1,156 @@
+// RoboCorea — ESP32 firmware entry point
+// ======================================
+// Brings up the hardware and spawns the FreeRTOS tasks:
+//
+//   Core 1                              Core 0
+//   ──────────────────────────         ──────────────────────────
+//   controlTask  50 Hz  prio 5         commsTask  50 Hz  prio 4
+//   sensorTask  ~50 Hz  prio 2         canTask   200 Hz  prio 4
+//
+// controlTask runs the state machine (RC → mix / flipper-PID / arm-relay).
+// commsTask owns the UART: it parses inbound frames and emits telemetry +
+// sensor + motor-status frames. canTask drains the TWAI bus and emits ODrive
+// telemetry RTRs. sensorTask samples the IMU + magnetometer over I2C.
+//
+// See reference/architecture.md and the firmware README for details.
+
+#include <Arduino.h>
+#include "config.h"
+#include "robot_types.h"
+
+#include "RC.h"
+#include "Sensors.h"
+#include "CANInterface.h"
+#include "Locomotion.h"
+#include "Comms.h"
+#include "Control.h"
+
+// ─── Core 1: control state machine ────────────────────────────────────────────
+static void controlTask(void*) {
+    const TickType_t period = pdMS_TO_TICKS(1000 / CONTROL_LOOP_HZ);
+    TickType_t last = xTaskGetTickCount();
+    for (;;) {
+        Control::tick();
+        vTaskDelayUntil(&last, period);
+    }
+}
+
+// ─── Core 0: CAN bus servicing ────────────────────────────────────────────────
+static void canTask(void*) {
+    const TickType_t period = pdMS_TO_TICKS(1000 / CAN_POLL_HZ);
+    TickType_t last = xTaskGetTickCount();
+    for (;;) {
+        CANInterface::poll();
+        vTaskDelayUntil(&last, period);
+    }
+}
+
+// ─── Core 1: fast sensors (IMU + magnetometer) ────────────────────────────────
+static void sensorTask(void*) {
+    for (;;) {
+        Sensors::runOnce();
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
+// ─── Core 0: UART comms + telemetry ───────────────────────────────────────────
+// All UART transmission happens here (plus the occasional gripper frame from the
+// control task, which is mutex-guarded inside Comms).
+static void commsTask(void*) {
+    const TickType_t telem_period = pdMS_TO_TICKS(1000 / CONTROL_LOOP_HZ);  // 50 Hz
+    TickType_t last = xTaskGetTickCount();
+    uint8_t status_div = 0;
+
+    for (;;) {
+        Comms::tick();   // drain RX, dispatch callbacks
+
+        if (xTaskGetTickCount() - last >= telem_period) {
+            last = xTaskGetTickCount();
+
+            SystemStatus status;
+            Control::getSystemStatus(status);
+
+            float spd_l = 0, spd_r = 0, flip[4] = {0, 0, 0, 0};
+            CANInterface::getTractionSpeeds(spd_l, spd_r);
+            CANInterface::getFlipperAngles(flip);
+
+            PPMFrame ppm;
+            RC::peekFrame(ppm);
+
+            // ── Telemetry ──────────────────────────────────────────────────
+            TelemetryPayload t;
+            t.mode  = (uint8_t)status.mode;
+            t.flags = (status.ppm_connected ? 0x01 : 0)
+                    | (status.sensor_mask   ? 0x02 : 0)
+                    | (status.can_ok        ? 0x04 : 0)
+                    | (status.estop         ? 0x08 : 0);
+            for (int i = 0; i < PPM_CHANNELS; i++) t.ppm[i] = ppm.valid ? ppm.ch[i] : 0;
+            t.speed_left    = (int16_t)(spd_l * 10.0f);
+            t.speed_right   = (int16_t)(spd_r * 10.0f);
+            t.flipper_angle = (int16_t)(flip[0] * 10.0f);
+            t.uptime_ms     = status.uptime_ms;
+            Comms::sendTelemetry(t);
+
+            Comms::sendEncoderExt(flip[0], flip[1], flip[2], flip[3]);
+
+            // ── System status + arm lifecycle (lower rate, 10 Hz) ──────────
+            if (++status_div >= 5) {
+                status_div = 0;
+                Comms::sendStatus(status);
+                ArmLifecyclePayload al;
+                CANInterface::getArmLifecycle(al);
+                Comms::sendArmLifecycle(al);
+            }
+
+            // ── Sensors (only what's enabled and freshly valid) ────────────
+            uint8_t mask = Sensors::getEnabledMask();
+            if (mask & SENSOR_BIT_MAG) { MagData m; Sensors::getMag(m); if (m.valid) Comms::sendMagData(m); }
+            if (mask & SENSOR_BIT_IMU) { ImuData i; Sensors::getImu(i); if (i.valid) Comms::sendImuData(i); }
+
+            // ── Motor status (send only fresh frames) ──────────────────────
+            for (uint8_t idx = 0; idx < 6; idx++) {
+                uint8_t id = CANInterface::vescIdByIndex(idx);
+                VescStatusPayload v;
+                if (id && CANInterface::getVescStatus(id, v)) Comms::sendVescStatus(v);
+            }
+            for (uint8_t j = 0; j < ODRIVE_NUM_JOINTS; j++) {
+                OdriveStatusPayload o;
+                if (CANInterface::getOdriveStatus(j, o)) Comms::sendOdriveStatus(o);
+            }
+            for (uint8_t j = 0; j < LKTECH_NUM_JOINTS; j++) {
+                LktechStatusPayload l;
+                if (CANInterface::getLktechStatus(j, l)) Comms::sendLktechStatus(l);
+            }
+            { Ze300StatusPayload z; if (CANInterface::getZe300Status(z)) Comms::sendZe300Status(z); }
+            for (uint8_t n = 0; n < CANInterface::odriveNodeCount(); n++) {
+                OdriveErrorPayload e;
+                if (CANInterface::getOdriveError(n, e)) Comms::sendOdriveError(e);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+void setup() {
+    Comms::begin();          // UART + TX mutex
+    Sensors::begin();        // I2C: BNO055 + LIS3MDL
+    CANInterface::begin();   // TWAI + arm controller bring-up (blocking)
+    Locomotion::begin();     // zero the drivetrain VESCs
+    Control::begin();        // register callbacks, configure flipper PIDs
+    RC::begin(PIN_PPM);      // attach the PPM ISR
+
+    xTaskCreatePinnedToCore(controlTask, "control", STACK_CONTROL, nullptr,
+                            PRIO_CONTROL, nullptr, TASK_CORE_CONTROL);
+    xTaskCreatePinnedToCore(commsTask,   "comms",   STACK_COMMS,   nullptr,
+                            PRIO_COMMS,   nullptr, TASK_CORE_COMMS);
+    xTaskCreatePinnedToCore(canTask,     "can",     STACK_CAN,     nullptr,
+                            PRIO_CAN,     nullptr, TASK_CORE_CAN);
+    xTaskCreatePinnedToCore(sensorTask,  "sensor",  STACK_SENSORS, nullptr,
+                            PRIO_SENSORS, nullptr, TASK_CORE_SENSORS);
+}
+
+void loop() {
+    // Everything runs in FreeRTOS tasks; nothing to do here.
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}

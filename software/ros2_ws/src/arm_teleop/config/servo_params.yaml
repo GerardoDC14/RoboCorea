@@ -1,0 +1,59 @@
+###############################################
+# SDLS servo parameters for the dicerox 6R arm.
+# These are the single tuning point for feel + singularity behaviour.
+###############################################
+servo_node:
+  ros__parameters:
+    base_frame: base_link
+    ee_frame: Link6
+    joint_names: [Joint1, Joint2, Joint3, Joint4, Joint5, Joint6]
+
+    publish_rate: 100.0      # Hz — solver + /joint_states output rate
+    auto_start: true         # begin running immediately (keyboard_servo needs this)
+
+    # Command scaling: teleop nodes emit [-1, 1]; these set full-deflection speed.
+    max_linear_speed: 0.25       # m/s
+    max_rotational_speed: 0.6    # rad/s
+    max_joint_speed: 1.0         # rad/s per-joint ceiling
+
+    # ── Selectively-damped solver ──────────────────────────────────────
+    # sigma_threshold (σ0): smallest singular value (in unit-weighted space)
+    #   below which that direction starts to get damped. Larger = damp earlier /
+    #   smoother but gives up tracking sooner.
+    # lambda_max: peak per-mode damping; worst-case joint-velocity gain in the
+    #   collapsing direction is ~1/(2·lambda_max). Larger = safer / softer.
+    # char_length: metres; weights the angular Jacobian rows so σ0 is comparable
+    #   for position (shoulder/elbow) and orientation (wrist) singularities.
+    #   Roughly the distance from the wrist to the tool tip.
+    sigma_threshold: 0.10
+    lambda_max: 0.04
+    char_length: 0.25
+
+    # ── Safety / feel ──────────────────────────────────────────────────
+    joint_limit_margin: 0.05        # rad: hard stop-out from URDF limits
+    joint_limit_scale_zone: 0.20    # rad: soft slow-down band before the limit
+    command_timeout: 0.2            # s: no command for this long → hold position
+    smoothing_alpha: 1.0            # input EMA (1.0 = off; lower = smoother/laggier)
+
+    # ── Closed-loop pose tracking (CLIK) ───────────────────────────────
+    # Holds the integral of the commanded twist and corrects pose error, so the
+    # EE doesn't drift — in particular it stops the orientation tilt that appears
+    # under a long pure translation. The anti-windup leash keeps the reference
+    # within reach so behaviour near singularities/limits stays stable.
+    pose_feedback: true
+    k_pos: 5.0            # position correction gain (1/s)
+    k_ori: 5.0            # orientation correction gain (1/s)
+    max_pos_error: 0.05  # m   — leash
+    max_ori_error: 0.20  # rad — leash
+
+    # Safety: halt servo output while the firmware reports a latched arm fault
+    # (esp32_bridge /arm/fault). Leave false for software-only twin testing;
+    # set true on the real robot (bringup launch).
+    respect_fault: false
+    fault_topic: /arm/fault
+
+    # Seed pose (rad), J1..J6 — should match the arm's actual pose at startup
+    # (the firmware treats this as boot-pose-relative). This default is a
+    # well-conditioned "ready" pose (σ_min≈0.12); NOTE the arm's all-zeros pose
+    # is an exact singularity, so don't seed from zeros.
+    initial_positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]

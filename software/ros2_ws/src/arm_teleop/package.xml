@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>arm_teleop</name>
+  <version>0.1.0</version>
+  <description>
+    Singularity-robust real-time servo for the dicerox 6R arm. An SVD
+    selectively-damped differential-IK node (sdls_servo) maps a Cartesian twist
+    to joint motion and publishes the result on /joint_states (which esp32_bridge
+    forwards to the ESP32 as MSG_ARM_JOINTS). Includes keyboard and joystick
+    teleop. No MoveIt / ros2_control dependency.
+  </description>
+  <maintainer email="nabetse069@gmail.com">RoboCorea</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>control_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>urdfdom_py</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

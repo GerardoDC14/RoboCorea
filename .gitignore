@@ -1,0 +1,37 @@
+# ── Nested repository (tracked on its own) ───────────────────────────────────
+# reference/TMR2026_Rescue is its own git repo — never track it from this one.
+reference/TMR2026_Rescue/
+
+# ── ESP32 firmware (PlatformIO) ──────────────────────────────────────────────
+# (firmware/ESP/.gitignore also covers this; kept here for any other pio project)
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# ── ROS 2 workspace (colcon) ─────────────────────────────────────────────────
+software/ros2_ws/build/
+software/ros2_ws/install/
+software/ros2_ws/log/
+.colcon_install_layout
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+# (compiled firmware/ROS artifacts already live under the ignored dirs above)
+*.log
+
+# ── OS / editor noise ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
