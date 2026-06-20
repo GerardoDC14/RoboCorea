@@ -26,7 +26,6 @@ public:
     // ── Outgoing ────────────────────────────────────────────────────────────
     static void sendTelemetry(const TelemetryPayload& p);
     static void sendMagData(const MagData& mag);
-    static void sendImuData(const ImuData& imu);
     static void sendEncoderExt(float fl, float fr, float rl, float rr);
     static void sendVescStatus(const VescStatusPayload& v);
     static void sendOdriveStatus(const OdriveStatusPayload& o);

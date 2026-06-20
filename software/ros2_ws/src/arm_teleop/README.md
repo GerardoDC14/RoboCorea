@@ -39,7 +39,43 @@ the loop on. The 6-joint result is published as `sensor_msgs/JointState` on
 
 `arm_kinematics.py` parses the URDF and builds FK + the geometric Jacobian using
 each joint's real `<axis>` (Rodrigues), so dicerox's `Joint4`/`Joint6` (`0 0 -1`)
-are signed correctly — unlike the legacy class which hard-coded +Z.
+are signed correctly — unlike the legacy class which hard-coded +Z. It also
+exposes `link_poses(q)` (world transform per link) for the collision checker.
+
+## Self-collision avoidance (`self_collision.py`)
+
+Beyond joint limits, the servo does **mesh-on-mesh** self-collision avoidance so
+the operator can't drive one link into another. It is **on by default** and
+degrades gracefully (warns, keeps running without it) if its deps are missing.
+
+How it works:
+
+- **Geometry:** one **low-poly** FCL `BVHModel` per link. The full-res CAD
+  collision STLs (Link6 ≈ 118k triangles) are ~20–30× too heavy for a 100 Hz
+  query — a single separated `Link6` distance query is ~4.4 ms raw vs ~0.16 ms
+  decimated. `scripts/make_collision_meshes.py` decimates `meshes/collision/` →
+  `meshes/collision_lowpoly/` (≈6% of the triangles), committed to the repo.
+- **ACM:** an allowed-collision matrix is learned once at startup by sampling
+  random valid configs — adjacent links (always touching at their joint) and
+  unreachable pairs are dropped, leaving only the pairs that can actually clash
+  (5 for this arm).
+- **Broadphase:** a per-pair world-AABB test skips the expensive BVH query for
+  pairs farther apart than the slow band, so a full sweep is ~0.14 ms; the gate
+  evaluates `q` and `q+dq` (two sweeps) only while the arm is moving.
+- **Policy (look-ahead damper):** a step that drives a pair into the **slow
+  band** is scaled down; into the **stop band** it is vetoed. The constraint
+  only applies to motion that *reduces* a pair's clearance — **retreating is
+  always allowed**, so the arm can never get stuck against itself.
+
+Regenerate the proxies after a URDF/mesh change:
+
+```bash
+pip install trimesh fast-simplification          # one-time, for the generator
+python3 src/arm_teleop/scripts/make_collision_meshes.py --target 1200
+```
+
+Runtime needs `python-fcl` + `trimesh` on the workstation (`pip install
+python-fcl trimesh`). Set `collision_check: false` to disable.
 
 ## Run
 
@@ -71,6 +107,9 @@ On the robot, `esp32_bridge` consumes `/joint_states` → `MSG_ARM_JOINTS`. Its
 | `max_joint_speed` | hard per-joint velocity ceiling |
 | `joint_limit_scale_zone` / `_margin` | soft slow-down band / hard stop-out |
 | `smoothing_alpha` | input EMA (1.0 = off) |
+| `collision_check` | master enable for mesh self-collision avoidance |
+| `collision_slow_dist` / `_stop_dist` | clearance (m) to start damping / veto approach |
+| `collision_acm_samples` | configs sampled to learn the allowed-collision matrix |
 
 > **Bench-verify before powered motion:** `initial_positions` must match the
 > arm's actual startup pose, and the firmware `*_DIR_*` signs (J4/J5 = −1) must

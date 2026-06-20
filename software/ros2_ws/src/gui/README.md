@@ -11,8 +11,8 @@ package (see `reference/architecture.md` §11.1), built in compiling increments.
 | Transport-agnostic `CameraHub` / `SourceManager` | **implemented** |
 | C920 **A/V** stream (H.264 video + Opus audio over one SRT) | **implemented** (needs GStreamer dev — see below) |
 | Speech-to-text (Vosk) fed from the A/V audio | **implemented** |
-| Dashboard (connection, mag, IMU, e-stop, sensor toggles, transcription) | **implemented** |
-| Odometry (mode/flags, traction, flippers, VESC table, arm telemetry) | **implemented** |
+| Dashboard (connection, mag, orientation from ZED2, e-stop, sensor toggles, transcription) | **implemented** |
+| Odometry (mode/flags, traction, track wheel-odometry, flippers, VESC table, arm telemetry) | **implemented** |
 | Digital twin (URDF/OpenGL, posed from `/joint_states`) | **implemented** |
 | CV filters (Hazmat YOLO, QR/barcode, shape detect) | **implemented** |
 | Settings / Keybind / PPM-calib dialogs | TODO |

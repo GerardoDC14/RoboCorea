@@ -3,6 +3,8 @@
 #include <QGridLayout>
 #include <QHBoxLayout>
 
+#include <cmath>
+
 // VESC IDs per architecture.md §8.1 (traction L/R = 1/2, flippers FL/FR/RL/RR = 3-6).
 static const char* VESC_NAMES[7] = {"?", "TL", "TR", "FL", "FR", "RL", "RR"};
 static const char* ARM_NAMES[7]  = {"?", "J1", "J2", "J3", "J4", "J5", "J6"};
@@ -15,6 +17,8 @@ OdometryPanel::OdometryPanel(rclcpp::Node::SharedPtr node, QWidget* parent)
 
     connect(this, &OdometryPanel::tracksUpdated,
             this, &OdometryPanel::onTracksUpdated, Qt::QueuedConnection);
+    connect(this, &OdometryPanel::wheelOdomUpdated,
+            this, &OdometryPanel::onWheelOdomUpdated, Qt::QueuedConnection);
     connect(this, &OdometryPanel::flipperExtUpdated,
             this, &OdometryPanel::onFlipperExtUpdated, Qt::QueuedConnection);
     connect(this, &OdometryPanel::modeUpdated,
@@ -32,6 +36,17 @@ OdometryPanel::OdometryPanel(rclcpp::Node::SharedPtr node, QWidget* parent)
         "/encoders/tracks", qos,
         [this](geometry_msgs::msg::Vector3::SharedPtr msg) {
             emit tracksUpdated(msg->x, msg->y);
+        });
+
+    // Track (wheel) odometry integrated from the VESC tachometers on the bridge.
+    wheel_odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
+        "/odom/wheel", qos,
+        [this](nav_msgs::msg::Odometry::SharedPtr msg) {
+            const auto& q = msg->pose.pose.orientation;
+            double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                    1.0 - 2.0 * (q.y * q.y + q.z * q.z)) * 180.0 / M_PI;
+            emit wheelOdomUpdated(msg->pose.pose.position.x, msg->pose.pose.position.y,
+                                  yaw, msg->twist.twist.linear.x);
         });
 
     flipper_sub_ = node_->create_subscription<std_msgs::msg::Float32MultiArray>(
@@ -133,6 +148,24 @@ void OdometryPanel::buildLayout()
         trac_row->addLayout(c);
     }
     main_layout_->addLayout(trac_row);
+
+    main_layout_->addWidget(makeHSep());
+
+    // ── Track odometry (wheel, from the VESC tachometers) ─────────────────────
+    main_layout_->addWidget(makeHeaderLabel("Track Odometry"));
+    {
+        auto* grid = new QGridLayout();
+        grid->setSpacing(3);
+        grid->addWidget(makeAxisLabel("X (m)"), 0, 0);
+        odom_x_ = makeValueLabel("--"); grid->addWidget(odom_x_, 0, 1);
+        grid->addWidget(makeAxisLabel("Y (m)"), 0, 2);
+        odom_y_ = makeValueLabel("--"); grid->addWidget(odom_y_, 0, 3);
+        grid->addWidget(makeAxisLabel("Yaw"), 1, 0);
+        odom_yaw_ = makeValueLabel("--"); grid->addWidget(odom_yaw_, 1, 1);
+        grid->addWidget(makeAxisLabel("vx (m/s)"), 1, 2);
+        odom_vx_ = makeValueLabel("--"); grid->addWidget(odom_vx_, 1, 3);
+        main_layout_->addLayout(grid);
+    }
 
     main_layout_->addWidget(makeHSep());
 
@@ -254,6 +287,14 @@ void OdometryPanel::onTracksUpdated(double left_rpm, double right_rpm)
 {
     trac_left_rpm_->setText(QString::number(left_rpm, 'f', 1));
     trac_right_rpm_->setText(QString::number(right_rpm, 'f', 1));
+}
+
+void OdometryPanel::onWheelOdomUpdated(double x_m, double y_m, double yaw_deg, double vx)
+{
+    odom_x_->setText(QString::number(x_m, 'f', 2));
+    odom_y_->setText(QString::number(y_m, 'f', 2));
+    odom_yaw_->setText(QString::number(yaw_deg, 'f', 1) + "°");
+    odom_vx_->setText(QString::number(vx, 'f', 2));
 }
 
 void OdometryPanel::onFlipperExtUpdated(float fl, float fr, float rl, float rr)

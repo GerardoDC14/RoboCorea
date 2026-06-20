@@ -46,7 +46,9 @@ is position-command and arm telemetry is too slow/jittery to close the loop on.
 
 from __future__ import annotations
 
+import os
 import threading
+import time
 
 import numpy as np
 import rclpy
@@ -65,7 +67,7 @@ STATUS_OK = 0
 STATUS_DECEL = 1       # near a singularity, degrading tracking in one direction
 STATUS_HALT = 2        # never emitted — this servo does not halt
 STATUS_LEAVING = 3
-STATUS_COLLISION = 4   # unused (no collision checking here)
+STATUS_COLLISION = 4   # link pair within the collision slow/stop band
 STATUS_JLIMIT = 5
 
 
@@ -125,6 +127,15 @@ class SdlsServo(Node):
         self.declare_parameter('command_timeout', 0.2)           # s → zero command
         self.declare_parameter('smoothing_alpha', 1.0)           # input EMA (1=off)
 
+        # mesh-on-mesh self-collision avoidance (FCL on low-poly link meshes).
+        # Look-ahead damper: any step that pushes an already-close pair closer is
+        # scaled (slow band) or vetoed (stop band); retreating is always allowed.
+        self.declare_parameter('collision_check', True)          # master enable
+        self.declare_parameter('collision_mesh_dir', '')         # '' → pkg collision_lowpoly
+        self.declare_parameter('collision_slow_dist', 0.06)      # m: start damping
+        self.declare_parameter('collision_stop_dist', 0.02)      # m: veto approach
+        self.declare_parameter('collision_acm_samples', 2000)    # ACM build samples
+
         # closed-loop pose tracking (kills drift, esp. orientation under pure
         # translation): hold the integral of the commanded twist and correct back
         self.declare_parameter('pose_feedback', True)
@@ -170,6 +181,8 @@ class SdlsServo(Node):
         self.respect_fault = bool(self.get_parameter('respect_fault').value)
         fault_topic = str(self.get_parameter('fault_topic').value)
         init = [float(v) for v in self.get_parameter('initial_positions').value]
+        self.coll_slow = float(self.get_parameter('collision_slow_dist').value)
+        self.coll_stop = float(self.get_parameter('collision_stop_dist').value)
 
         # ── kinematics ────────────────────────────────────────────────
         self.kin = ArmKinematics(urdf, base=self.base_frame, tip=self.ee_frame)
@@ -183,6 +196,9 @@ class SdlsServo(Node):
 
         # task-space weight W = diag(1,1,1, L,L,L) for unit consistency
         self._W = np.diag([1.0, 1.0, 1.0, self.L, self.L, self.L])
+
+        # ── self-collision checker (optional) ─────────────────────────
+        self.collision = self._init_collision()
 
         # ── state (guarded by _lock) ──────────────────────────────────
         self._lock = threading.Lock()
@@ -218,6 +234,49 @@ class SdlsServo(Node):
             f'SDLS servo ready — {self.n} joints, {self.rate:.0f} Hz, '
             f'σ0={self.sigma0} λ_max={self.lambda_max} L={self.L} '
             f'running={self._running}')
+
+    # ── self-collision setup ─────────────────────────────────────────
+
+    def _init_collision(self):
+        """Build the FCL self-collision checker, or return None (disabled).
+
+        Disabled cleanly (warn, not crash) when the master flag is off, the
+        deps are missing, or the meshes aren't found — the servo then behaves
+        exactly as before (joint-limit + singularity safety only).
+        """
+        if not bool(self.get_parameter('collision_check').value):
+            self.get_logger().info('self-collision check DISABLED (collision_check=false)')
+            return None
+        try:
+            from arm_teleop.self_collision import SelfCollision
+        except Exception as exc:
+            self.get_logger().warn(f'self-collision DISABLED — import failed: {exc}')
+            return None
+
+        mesh_dir = str(self.get_parameter('collision_mesh_dir').value)
+        if not mesh_dir:
+            try:
+                from ament_index_python.packages import get_package_share_directory
+                mesh_dir = os.path.join(get_package_share_directory('arm_teleop'),
+                                        'meshes', 'collision_lowpoly')
+            except Exception as exc:
+                self.get_logger().warn(f'self-collision DISABLED — no mesh dir: {exc}')
+                return None
+
+        n = int(self.get_parameter('collision_acm_samples').value)
+        try:
+            t0 = time.time()
+            checker = SelfCollision(self.kin, mesh_dir, self.kin.child_links,
+                                    acm_samples=n, near_band=self.coll_slow + 0.02,
+                                    logger=self.get_logger().info)
+            self.get_logger().info(
+                f'self-collision ENABLED — {len(checker.pairs)} active pairs, '
+                f'slow<{self.coll_slow}m stop<{self.coll_stop}m, '
+                f'ACM built in {time.time() - t0:.1f}s')
+            return checker
+        except Exception as exc:
+            self.get_logger().warn(f'self-collision DISABLED — init failed: {exc}')
+            return None
 
     # ── callbacks ─────────────────────────────────────────────────────
 
@@ -290,6 +349,12 @@ class SdlsServo(Node):
         else:
             dq, status = self._cartesian_step(q, twist, frame, dt)
 
+        # mesh-on-mesh self-collision gate (skipped when idle → no FCL cost)
+        if self.collision is not None and np.any(dq):
+            dq, hit = self._collision_filter(q, dq)
+            if hit:
+                status = STATUS_COLLISION
+
         # hard joint-limit clamp
         q_new = np.clip(q + dq, self.kin.lower + self.jl_margin,
                         self.kin.upper - self.jl_margin)
@@ -298,6 +363,36 @@ class SdlsServo(Node):
             self._q = q_new
         self._publish(q_new, (q_new - q) / dt if dt > 0 else np.zeros(self.n))
         self._publish_status(status)
+
+    # ── self-collision look-ahead damper ──────────────────────────────
+
+    def _collision_filter(self, q, dq):
+        """Scale/veto `dq` so no link pair is driven into another.
+
+        Compares per-pair clearance now (`q`) vs after the candidate step
+        (`q + dq`). A pair only constrains the step when the step *reduces* its
+        clearance ("approaching"); a step that increases clearance is always
+        allowed, so the operator can always drive out of a near-collision.
+
+          clearance after step <= stop band  → veto (hold this tick)
+          clearance after step  < slow band  → scale dq toward zero linearly
+
+        Returns (dq, hit) where `hit` is True if the step was scaled or vetoed.
+        """
+        d_now = self.collision.distances(q)
+        d_next = self.collision.distances(q + dq)
+        scale = 1.0
+        hit = False
+        for pair, dn in d_next.items():
+            if dn >= d_now.get(pair, float('inf')):
+                continue                       # retreating / parallel → unconstrained
+            if dn <= self.coll_stop:
+                return np.zeros_like(dq), True  # entering stop band while approaching
+            if dn < self.coll_slow:
+                f = (dn - self.coll_stop) / (self.coll_slow - self.coll_stop)
+                scale = min(scale, max(f, 0.0))
+                hit = True
+        return dq * scale, hit
 
     # ── joint-space jog (no Jacobian, no singularity) ─────────────────
 

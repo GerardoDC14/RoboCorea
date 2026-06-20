@@ -112,18 +112,13 @@ DashboardPanel::DashboardPanel(rclcpp::Node::SharedPtr node, QWidget* parent)
 
     add_hsep();
 
-    // ── IMU orientation ──────────────────────────────────────────────────────
+    // ── Orientation (from the ZED2 IMU; no ESP32 IMU) ─────────────────────────
+    // Sourced from the ZED2 camera driver, not the ESP32 — so there is no
+    // sensor-enable toggle here (the ZED isn't controlled by the enable mask).
     {
-        auto* imu_hdr_row = new QHBoxLayout();
-        imu_hdr_row->setSpacing(4);
-        auto* imu_hdr = new QLabel("Orientation", this);
+        auto* imu_hdr = new QLabel("Orientation (ZED2)", this);
         imu_hdr->setStyleSheet(hdr_style);
-        imu_toggle_ = make_sensor_toggle();
-        connect(imu_toggle_, &QPushButton::toggled, this, &DashboardPanel::onSensorToggled);
-        imu_hdr_row->addWidget(imu_hdr);
-        imu_hdr_row->addStretch();
-        imu_hdr_row->addWidget(imu_toggle_);
-        layout->addLayout(imu_hdr_row);
+        layout->addWidget(imu_hdr);
     }
     auto* imu_row = new QHBoxLayout();
     imu_row->setSpacing(8);
@@ -189,8 +184,11 @@ DashboardPanel::DashboardPanel(rclcpp::Node::SharedPtr node, QWidget* parent)
                                      msg->magnetic_field.z);
         });
 
+    // Orientation comes from the ZED2 camera's IMU (the deferred ZED/nav stack),
+    // not the ESP32. Exact topic depends on the ZED launch config; this is the
+    // zed-ros2-wrapper default and stays blank until that node runs.
     imu_sub_ = node_->create_subscription<sensor_msgs::msg::Imu>(
-        "/sensors/imu", sensor_qos,
+        "/zed2/zed_node/imu/data", sensor_qos,
         [this](sensor_msgs::msg::Imu::SharedPtr msg) {
             double qw = msg->orientation.w, qx = msg->orientation.x;
             double qy = msg->orientation.y, qz = msg->orientation.z;
@@ -356,8 +354,6 @@ void DashboardPanel::onSensorToggled()
     sensor_mask_ &= (1 << 1);  // preserve thermal bit (driven by the video panel)
     if (mag_toggle_->isChecked()) { sensor_mask_ |= (1 << 0); mag_toggle_->setText("ON"); }
     else                          { mag_toggle_->setText("OFF"); }
-    if (imu_toggle_->isChecked()) { sensor_mask_ |= (1 << 3); imu_toggle_->setText("ON"); }
-    else                          { imu_toggle_->setText("OFF"); }
     publishSensorMask();
 }
 

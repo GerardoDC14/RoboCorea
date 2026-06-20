@@ -10,7 +10,7 @@
 // controlTask runs the state machine (RC → mix / flipper-PID / arm-relay).
 // commsTask owns the UART: it parses inbound frames and emits telemetry +
 // sensor + motor-status frames. canTask drains the TWAI bus and emits ODrive
-// telemetry RTRs. sensorTask samples the IMU + magnetometer over I2C.
+// telemetry RTRs. sensorTask samples the magnetometer over I2C.
 //
 // See reference/architecture.md and the firmware README for details.
 
@@ -45,7 +45,7 @@ static void canTask(void*) {
     }
 }
 
-// ─── Core 1: fast sensors (IMU + magnetometer) ────────────────────────────────
+// ─── Core 1: magnetometer sampling ────────────────────────────────────────────
 static void sensorTask(void*) {
     for (;;) {
         Sensors::runOnce();
@@ -105,7 +105,6 @@ static void commsTask(void*) {
             // ── Sensors (only what's enabled and freshly valid) ────────────
             uint8_t mask = Sensors::getEnabledMask();
             if (mask & SENSOR_BIT_MAG) { MagData m; Sensors::getMag(m); if (m.valid) Comms::sendMagData(m); }
-            if (mask & SENSOR_BIT_IMU) { ImuData i; Sensors::getImu(i); if (i.valid) Comms::sendImuData(i); }
 
             // ── Motor status (send only fresh frames) ──────────────────────
             for (uint8_t idx = 0; idx < 6; idx++) {
@@ -134,7 +133,7 @@ static void commsTask(void*) {
 
 void setup() {
     Comms::begin();          // UART + TX mutex
-    Sensors::begin();        // I2C: BNO055 + LIS3MDL
+    Sensors::begin();        // I2C: LIS3MDL magnetometer
     CANInterface::begin();   // TWAI + arm controller bring-up (blocking)
     Locomotion::begin();     // zero the drivetrain VESCs
     Control::begin();        // register callbacks, configure flipper PIDs

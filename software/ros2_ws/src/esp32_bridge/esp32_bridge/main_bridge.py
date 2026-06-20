@@ -16,11 +16,11 @@ Published (ESP32 → PC)
 /robot/ppm            std_msgs/Int16MultiArray    raw PPM µs [ch1..ch6]
 /robot/status         diagnostic_msgs/DiagnosticArray
 /robot/deadband       std_msgs/Float32            normalised RC deadband (echoed from calib)
-/encoders/tracks      geometry_msgs/Vector3       x=left_rpm, y=right_rpm
+/encoders/tracks      geometry_msgs/Vector3       x=left_rpm, y=right_rpm (live track speed)
 /encoders/flipper     std_msgs/Float32MultiArray  [fl, fr, rl, rr] degrees
-/sensors/imu          sensor_msgs/Imu             BNO055 orientation + accel + gyro
+/odom/wheel           nav_msgs/Odometry           track odometry from the traction VESC tachometers
 /sensors/mag          sensor_msgs/MagneticField   LIS3MDL XYZ
-/motors/vesc_status   std_msgs/Float32MultiArray  [id, erpm, current_A, duty, t_fet, t_mot, v_in]
+/motors/vesc_status   std_msgs/Float32MultiArray  [id, erpm, current_A, duty, t_fet, t_mot, v_in, tacho]
 /motors/odrive_status std_msgs/Float32MultiArray  [joint, pos_turns, vel_turns_s, iq_A, bus_V, bus_A]
 /motors/lktech_status std_msgs/Float32MultiArray  [joint, motor_id, temp_C, iq_A, dps, angle, out_deg]
 /motors/ze300_status  std_msgs/Float32MultiArray  [id, temp_C, iq_A, rpm, single_turn, pos_counts, out_deg]
@@ -31,7 +31,7 @@ Subscribed (PC → ESP32)
 ───────────────────────
 /robot/estop          std_msgs/Bool               True = ESTOP, False = ESTOP_CLEAR
 /joint_states         sensor_msgs/JointState      arm joint positions (rad) → MSG_ARM_JOINTS
-/sensors/enable_mask  std_msgs/UInt8              bit0 mag, bit3 imu (thermal/gas unused here)
+/sensors/enable_mask  std_msgs/UInt8              bit0 mag (thermal/gas/imu bits unused here)
 /robot/keybind        std_msgs/UInt8MultiArray    15 bytes (3 modes × 5 channels)
 /robot/ppm_calib      std_msgs/UInt16MultiArray   19 values (6ch × min/neu/max + deadband)
 
@@ -41,6 +41,20 @@ serial_port (str)  /dev/ttyUSB0
 baud_rate   (int)  921600
 joint_names (str[]) URDF joint names in J1..J6 order (for /joint_states mapping)
 joint_command_signs (float[]) URDF radians → firmware physical-degree signs
+
+Track odometry (VESC tachometer → /odom/wheel). The two traction VESC tachometers
+are converted to per-track distance and integrated into a 2D wheel-odometry pose.
+This feeds the (deferred) robot_localization EKF that fuses it with the ZED2; it is
+published WITHOUT a TF — the EKF owns odom→base_link. The covariances deliberately
+down-weight yaw (a skid-steer tracked robot's wheel heading is unreliable under
+track slip). Measure/confirm these on the robot:
+  traction_id_left / traction_id_right (int)   VESC CAN ids (config.h: 60 / 50)
+  traction_dir_left / traction_dir_right (float) tacho sign (match config.h TRACTION_DIR_*)
+  wheel_circumference_m (float)  track sprocket effective circumference  [MEASURE]
+  track_width_m (float)          lateral distance between the two tracks  [MEASURE]
+  motor_pole_pairs (int)         VESC motor pole pairs (config.h: 7)
+  gear_ratio (float)             motor→output reduction (config.h: 100)
+  tacho_steps_per_erev (float)   VESC tachometer steps per electrical rev (6; confirm vs VESC fw)
 """
 
 import math
@@ -58,7 +72,8 @@ from std_msgs.msg import (
     Bool, String, UInt8, UInt16, Float32, Float32MultiArray,
     Int16MultiArray, UInt8MultiArray, UInt16MultiArray,
 )
-from sensor_msgs.msg import Imu, MagneticField, JointState
+from sensor_msgs.msg import MagneticField, JointState
+from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Vector3
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from std_srvs.srv import Trigger
@@ -67,7 +82,7 @@ from std_srvs.srv import Trigger
 MSG_TELEMETRY    = 0x01
 MSG_MAG          = 0x03
 MSG_STATUS       = 0x05
-MSG_IMU          = 0x06
+# 0x06 (MSG_SENSOR_IMU) reserved/unused — no IMU on the ESP32; orientation is from the ZED2.
 MSG_ENCODER_EXT  = 0x07
 MSG_VESC_STATUS  = 0x08
 MSG_ODRIVE_STATUS = 0x0A
@@ -133,6 +148,43 @@ class ESP32BridgeNode(Node):
             self._joint_command_signs = [-1.0, -1.0, -1.0, -1.0, -1.0, 1.0]
         self._ser = None
 
+        # ── Track (wheel) odometry from the VESC tachometers ──────────────────
+        # Defaults match config.h; the geometry values MUST be measured on the robot.
+        self.declare_parameter('traction_id_left', 60)
+        self.declare_parameter('traction_id_right', 50)
+        self.declare_parameter('traction_dir_left', 1.0)
+        self.declare_parameter('traction_dir_right', 1.0)
+        self.declare_parameter('wheel_circumference_m', 0.5)   # TODO: measure sprocket effective circumference
+        self.declare_parameter('track_width_m', 0.4)           # TODO: measure track centre-to-centre
+        self.declare_parameter('motor_pole_pairs', 7)
+        self.declare_parameter('gear_ratio', 100.0)
+        self.declare_parameter('tacho_steps_per_erev', 6.0)    # VESC commutation steps/erev (confirm vs VESC fw)
+        self.declare_parameter('odom_frame', 'odom')
+        self.declare_parameter('odom_child_frame', 'base_link')
+        self.declare_parameter('odom_rate_hz', 50.0)
+
+        self._trac_id_l = int(self.get_parameter('traction_id_left').value)
+        self._trac_id_r = int(self.get_parameter('traction_id_right').value)
+        self._trac_dir_l = float(self.get_parameter('traction_dir_left').value)
+        self._trac_dir_r = float(self.get_parameter('traction_dir_right').value)
+        self._wheel_circ_m = float(self.get_parameter('wheel_circumference_m').value)
+        self._track_width_m = float(self.get_parameter('track_width_m').value)
+        self._pole_pairs = int(self.get_parameter('motor_pole_pairs').value)
+        self._gear_ratio = float(self.get_parameter('gear_ratio').value)
+        self._tacho_steps_per_erev = float(self.get_parameter('tacho_steps_per_erev').value)
+        self._odom_frame = str(self.get_parameter('odom_frame').value)
+        self._odom_child_frame = str(self.get_parameter('odom_child_frame').value)
+        self._odom_rate_hz = float(self.get_parameter('odom_rate_hz').value)
+
+        # Wheel-odometry integrator state.
+        self._track_dist = {'L': None, 'R': None}   # per-side distance (m), relative to first reading
+        self._track_zero = {'L': None, 'R': None}   # first cumulative reading (m), subtracted out
+        self._odom_last = {'L': 0.0, 'R': 0.0}       # last integrated per-side distance (m)
+        self._odom_x = 0.0
+        self._odom_y = 0.0
+        self._odom_yaw = 0.0
+        self._odom_last_t = None
+
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE, depth=10)
@@ -149,7 +201,7 @@ class ESP32BridgeNode(Node):
         self._pub_deadband  = self.create_publisher(Float32,           '/robot/deadband',  latched_qos)
         self._pub_tracks    = self.create_publisher(Vector3,           '/encoders/tracks', sensor_qos)
         self._pub_flipper   = self.create_publisher(Float32MultiArray, '/encoders/flipper', sensor_qos)
-        self._pub_imu       = self.create_publisher(Imu,               '/sensors/imu',     sensor_qos)
+        self._pub_wheel_odom = self.create_publisher(Odometry,         '/odom/wheel',      sensor_qos)
         self._pub_mag       = self.create_publisher(MagneticField,     '/sensors/mag',     sensor_qos)
         self._pub_vesc      = self.create_publisher(Float32MultiArray, '/motors/vesc_status',   sensor_qos)
         self._pub_odrive    = self.create_publisher(Float32MultiArray, '/motors/odrive_status', sensor_qos)
@@ -179,7 +231,6 @@ class ESP32BridgeNode(Node):
             MSG_TELEMETRY:     self._handle_telemetry,
             MSG_MAG:           self._handle_mag,
             MSG_STATUS:        self._handle_status,
-            MSG_IMU:           self._handle_imu,
             MSG_ENCODER_EXT:   self._handle_encoder_ext,
             MSG_VESC_STATUS:   self._handle_vesc_status,
             MSG_ODRIVE_STATUS: self._handle_odrive_status,
@@ -189,6 +240,11 @@ class ESP32BridgeNode(Node):
             MSG_ARM_LIFECYCLE: self._handle_arm_lifecycle,
             MSG_GRIPPER:       self._handle_gripper,
         }
+
+        # Integrate wheel odometry on a fixed-rate timer (decoupled from the async,
+        # per-side arrival of the VESC status frames so dt is stable).
+        rate = self._odom_rate_hz if self._odom_rate_hz > 0.0 else 50.0
+        self._odom_timer = self.create_timer(1.0 / rate, self._integrate_wheel_odom)
 
         self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
         self._rx_thread.start()
@@ -309,38 +365,6 @@ class ESP32BridgeNode(Node):
         msg.data = [fl / 10.0, fr / 10.0, rl / 10.0, rr / 10.0]
         self._pub_flipper.publish(msg)
 
-    def _handle_imu(self, payload: bytes):
-        fmt = '<' + 'h' * 9 + 'B'
-        if len(payload) < struct.calcsize(fmt):
-            return
-        (yaw10, pitch10, roll10, ax100, ay100, az100,
-         gx1000, gy1000, gz1000, calib) = struct.unpack_from(fmt, payload)
-
-        msg = Imu()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'imu_link'
-
-        yaw, pitch, roll = (math.radians(yaw10 / 10.0),
-                            math.radians(pitch10 / 10.0),
-                            math.radians(roll10 / 10.0))
-        cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
-        cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
-        cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
-        msg.orientation.w = cr * cp * cy + sr * sp * sy
-        msg.orientation.x = sr * cp * cy - cr * sp * sy
-        msg.orientation.y = cr * sp * cy + sr * cp * sy
-        msg.orientation.z = cr * cp * sy - sr * sp * cy
-        msg.linear_acceleration.x = ax100 / 100.0
-        msg.linear_acceleration.y = ay100 / 100.0
-        msg.linear_acceleration.z = az100 / 100.0
-        msg.angular_velocity.x = gx1000 / 1000.0
-        msg.angular_velocity.y = gy1000 / 1000.0
-        msg.angular_velocity.z = gz1000 / 1000.0
-        msg.orientation_covariance[0] = -1.0
-        msg.angular_velocity_covariance[0] = -1.0
-        msg.linear_acceleration_covariance[0] = -1.0
-        self._pub_imu.publish(msg)
-
     def _handle_mag(self, payload: bytes):
         fmt = '<hhh'
         if len(payload) < struct.calcsize(fmt):
@@ -355,14 +379,93 @@ class ESP32BridgeNode(Node):
         self._pub_mag.publish(msg)
 
     def _handle_vesc_status(self, payload: bytes):
-        fmt = '<Bihhhhh'
+        fmt = '<Bihhhhhi'
         if len(payload) < struct.calcsize(fmt):
             return
-        vid, erpm, cur10, duty1000, tfet10, tmot10, vin10 = struct.unpack_from(fmt, payload)
+        vid, erpm, cur10, duty1000, tfet10, tmot10, vin10, tacho = struct.unpack_from(fmt, payload)
         msg = Float32MultiArray()
         msg.data = [float(vid), float(erpm), cur10 / 10.0, duty1000 / 1000.0,
-                    tfet10 / 10.0, tmot10 / 10.0, vin10 / 10.0]
+                    tfet10 / 10.0, tmot10 / 10.0, vin10 / 10.0, float(tacho)]
         self._pub_vesc.publish(msg)
+
+        # Feed the wheel-odometry integrator from the two traction VESCs.
+        if vid == self._trac_id_l:
+            self._update_track_distance('L', tacho, self._trac_dir_l)
+        elif vid == self._trac_id_r:
+            self._update_track_distance('R', tacho, self._trac_dir_r)
+
+    # ── Wheel odometry ────────────────────────────────────────────────────────
+    def _tacho_to_metres(self, tacho_counts: int, direction: float) -> float:
+        """VESC tachometer (commutation steps) → output-shaft distance in metres."""
+        erevs = tacho_counts / self._tacho_steps_per_erev
+        mech_revs = erevs / max(self._pole_pairs, 1)
+        output_revs = mech_revs / (self._gear_ratio if self._gear_ratio else 1.0)
+        return direction * output_revs * self._wheel_circ_m
+
+    def _update_track_distance(self, side: str, tacho_counts: int, direction: float):
+        dist = self._tacho_to_metres(tacho_counts, direction)
+        if self._track_zero[side] is None:
+            self._track_zero[side] = dist        # zero the cumulative count at first reading
+        self._track_dist[side] = dist - self._track_zero[side]
+
+    def _integrate_wheel_odom(self):
+        dl_total, dr_total = self._track_dist['L'], self._track_dist['R']
+        if dl_total is None or dr_total is None:
+            return  # need both tracks before integrating
+
+        now = self.get_clock().now()
+        if self._odom_last_t is None:
+            self._odom_last_t = now
+            self._odom_last['L'] = dl_total
+            self._odom_last['R'] = dr_total
+            return
+
+        dt = (now - self._odom_last_t).nanoseconds * 1e-9
+        if dt <= 0.0:
+            return
+
+        dl = dl_total - self._odom_last['L']
+        dr = dr_total - self._odom_last['R']
+        self._odom_last['L'] = dl_total
+        self._odom_last['R'] = dr_total
+        self._odom_last_t = now
+
+        ds = 0.5 * (dl + dr)                                  # forward increment (reliable)
+        dyaw = (dr - dl) / self._track_width_m if self._track_width_m else 0.0  # skid-steer (unreliable)
+        yaw_mid = self._odom_yaw + 0.5 * dyaw
+        self._odom_x += ds * math.cos(yaw_mid)
+        self._odom_y += ds * math.sin(yaw_mid)
+        self._odom_yaw = math.atan2(math.sin(self._odom_yaw + dyaw),
+                                    math.cos(self._odom_yaw + dyaw))
+
+        odom = Odometry()
+        odom.header.stamp = now.to_msg()
+        odom.header.frame_id = self._odom_frame
+        odom.child_frame_id = self._odom_child_frame
+        odom.pose.pose.position.x = self._odom_x
+        odom.pose.pose.position.y = self._odom_y
+        odom.pose.pose.orientation.z = math.sin(self._odom_yaw * 0.5)
+        odom.pose.pose.orientation.w = math.cos(self._odom_yaw * 0.5)
+        odom.twist.twist.linear.x = ds / dt
+        odom.twist.twist.angular.z = dyaw / dt
+
+        # Skid-steer covariances: forward (x / vx) is trustworthy, yaw is NOT — let
+        # the EKF take heading from the ZED2 instead. Unused 2D axes get large values.
+        # [x, y, z, roll, pitch, yaw] diagonal, row-major 6×6. Tune on hardware.
+        big = 1e6
+        odom.pose.covariance[0] = 0.05      # x
+        odom.pose.covariance[7] = 0.05      # y
+        odom.pose.covariance[14] = big      # z
+        odom.pose.covariance[21] = big      # roll
+        odom.pose.covariance[28] = big      # pitch
+        odom.pose.covariance[35] = 0.5      # yaw (high → distrust)
+        odom.twist.covariance[0] = 0.02     # vx
+        odom.twist.covariance[7] = big      # vy
+        odom.twist.covariance[14] = big     # vz
+        odom.twist.covariance[21] = big     # vroll
+        odom.twist.covariance[28] = big     # vpitch
+        odom.twist.covariance[35] = 0.5     # vyaw (high → distrust)
+        self._pub_wheel_odom.publish(odom)
 
     def _handle_odrive_status(self, payload: bytes):
         fmt = '<Bhhhhh'

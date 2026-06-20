@@ -77,9 +77,10 @@ stack) and makes these deliberate changes:
 | CAN transceiver | MCP2515 over **SPI** | **On-board SMD MCP2515** over SPI (permanent); TWAI + SN65HVD230 kept compilable as a future option |
 | Traction drivers | ODrive (CANSimple) | **VESC** (all 6 base motors are identical VESCs) |
 | Flipper drivers | VESC | VESC; **position loop runs on the VESC** (LispBM), not the ESP32 |
-| Base position feedback | Quadrature encoders on ESP32 PCNT | **Hall feedback via the VESC over CAN** (no separate encoders) |
+| Base position feedback | Quadrature encoders on ESP32 PCNT | **Hall feedback via the VESC over CAN** (no separate encoders); the VESC **tachometer** is forwarded for wheel odometry |
+| Odometry | Quadrature encoders | **ZED2 VIO + VESC-tachometer wheel odom**, to be fused by a planned `robot_localization` EKF |
 | Thermal camera | MLX90640 on the **ESP32** I2C bus | MLX90640 on the **Jetson** I2C (GPIO) |
-| Sensors on ESP32 | BNO055 IMU, QMC5883L mag, MQ2 gas | BNO055 IMU + **LIS3MDL** mag (**gas sensor dropped**) |
+| Sensors on ESP32 | BNO055 IMU, QMC5883L mag, MQ2 gas | **LIS3MDL** mag only (**IMU dropped — orientation now from the ZED2**; gas sensor dropped) |
 | Robot↔PC link | micro-ROS *or* serial | **Plain serial** + a ROS 2 bridge node (preferred) |
 | Cameras | Streamed from robot over the network (GStreamer) | **RF analog cams → USB digitizers at the workstation** (driving) **+ 2× C920 on the Jetson → onboard H.264 (+Opus) over SRT** (inspection/CV); thermal still via ROS |
 | Arm | ODrive J1–J3 + ZE300 J4 + LKTech J5–J6 | **Unchanged** — same mixed-CAN arm |
@@ -98,7 +99,7 @@ panels) carries over, adapted to the single-robot reality.
  (held  │   receiver ──PPM (1 wire)──────►│            ESP32               │  │
   by    │   (2.4 GHz)                     │  RC decode · mode FSM ·        │  │
 operator)                                 │  flipper cmd · VESC/arm CAN ·  │  │
-        │                                 │  BNO055 + LIS3MDL (I2C)  ·     │  │
+        │                                 │  LIS3MDL mag (I2C)  ·          │  │
         │                                 │  binary UART telemetry         │  │
         │                                 └───┬───────────────────┬────────┘  │
         │                          CAN(MCP)   │                   │ USB        │
@@ -166,16 +167,15 @@ competition link, **not** ROS/DDS. Only the tiny **thermal** image traverses ROS
 | 6-DOF robotic arm | 1 | Mixed CAN | J1–J3 ODrive, J4 ZE300, J5–J6 LKTech. See §8. Driven on the **same CAN bus**. |
 | NVIDIA Jetson Orin Nano | 1 | USB to ESP32; I2C/USB for sensors | Runs ROS 2 Humble on Ubuntu 22.04. Robot-side relay. |
 | MLX90640 thermal camera | 1 | **I2C → Jetson GPIO** | 32×24 thermal array. Read by a Jetson node, **not** the ESP32. |
-| BNO055 IMU | 1 | I2C → ESP32 | Fused orientation + accel + gyro (+ built-in magnetometer). Addr `0x28`. |
-| LIS3MDL magnetometer | 1 | I2C → ESP32 | Heading reference. |
-| ZED2 stereo camera | 1 | USB → Jetson | Visual-inertial odometry source for **future** SLAM/nav. |
+| LIS3MDL magnetometer | 1 | I2C → ESP32 | Heading reference. **The only sensor on the ESP32 I2C bus** (no IMU). |
+| ZED2 stereo camera | 1 | USB → Jetson | Visual-inertial odometry **and the robot's orientation/IMU source** (replaces the dropped BNO055). Feeds the planned odometry EKF + future SLAM/nav. |
 | RPLidar A2M12 | 1 | USB → Jetson | 2D lidar for **future** SLAM/nav. |
 | RF (FPV) camera | 2 | 5.8 GHz RF → USB digitizer → **workstation** | Appear as `/dev/videoN` webcams. **Driving** feed (low-latency, low-res). |
 | Logitech C920 Pro | 2 | USB → Jetson | **Onboard H.264** (UVC) + built-in mic. **Inspection / CV** feed — streamed to the GUI as H.264 (front cam also Opus audio) over SRT (§11). |
 
 **Buses summary**
 
-- **ESP32 I2C** (`SDA=GPIO21`, `SCL=GPIO22`): BNO055 + LIS3MDL.
+- **ESP32 I2C** (`SDA=GPIO21`, `SCL=GPIO22`): LIS3MDL magnetometer (no IMU).
 - **ESP32 CAN** via an **on-board SMD MCP2515** over SPI
   (`CS=GPIO5`, `SCK=GPIO18`, `MISO=GPIO19`, `MOSI=GPIO23`, 8 MHz crystal),
   **500 kbps**: all 6 VESCs + 3 ODrives + 1 ZE300 + 2 LKTech share this single
@@ -199,7 +199,7 @@ competition link, **not** ROS/DDS. Only the tiny **thermal** image traverses ROS
 | Traction differential mixing → VESC RPM | ✅ | | |
 | Flipper stick → target angle (loop closed on the VESC) | ✅ | | |
 | Arm CAN relay (ODrive/ZE300/LKTech) | ✅ | | |
-| BNO055 IMU + LIS3MDL mag read | ✅ | | |
+| LIS3MDL magnetometer read | ✅ | | |
 | Binary UART telemetry/commands | ✅ | | |
 | Serial ⇄ ROS 2 bridge (`esp32_bridge`) | | ✅ | |
 | MLX90640 thermal → ROS `Image` | | ✅ | |
@@ -290,7 +290,7 @@ firmware/
       Locomotion/       # Differential mixing + flipper target angle / hold → VESC
       CANInterface/     # CAN HAL (MCP2515 active / TWAI optional); VESC + ODrive + ZE300 + LKTech
       Comms/            # Binary UART protocol TX/RX
-      Sensors/          # BNO055 + LIS3MDL (I2C)
+      Sensors/          # LIS3MDL magnetometer (I2C; no IMU — orientation from ZED2)
       PID/              # Reusable PID (shortest-angle + D low-pass) — spare; flippers loop on the VESC
       Debug/            # Optional serial debug (mutually aware of ENABLE_COMMS)
     src/
@@ -314,7 +314,7 @@ Jetson now):
 | 0 | `commsTask` | 50 Hz | 4 | UART RX parse + TX telemetry |
 | 0 | `canTask` | 200 Hz | 4 | CAN poll; VESC/ODrive/ZE300/LKTech TX + status parse + bus-health recovery |
 | 1 | `controlTask` | 50 Hz | 5 (highest) | Mode FSM, keybind logic, flipper setpoint integration, motor output |
-| 1 | `sensorTask` | ≤50 Hz | 2 | BNO055 + LIS3MDL sampling |
+| 1 | `sensorTask` | ≤50 Hz | 2 | LIS3MDL magnetometer sampling |
 
 `controlTask` uses `vTaskDelayUntil` for a strict, drift-free period. The
 control loop target is **50 Hz**.
@@ -350,14 +350,15 @@ control loop target is **50 Hz**.
 
 ### 7.4 Sensors
 
-- **BNO055** (I2C `0x28`): fused Euler orientation, gravity-compensated linear
-  accel, angular velocity, and a packed 1-byte calibration status. Built-in
-  magnetometer.
 - **LIS3MDL** (I2C, Adafruit driver): magnetometer XYZ in µT (heading reference).
-- Per-sensor rate caps in `config.h` so the UART isn't flooded.
-- A sensor-enable bitmask (PC→ESP32) turns sensors on/off at runtime. With gas
-  and thermal removed from the ESP32, only **mag** and **imu** bits remain
-  meaningful on the ESP32 side.
+  This is the **only** sensor on the ESP32 I2C bus.
+- **No IMU on the ESP32.** The BNO055 was removed; the robot's orientation/IMU now
+  comes from the **ZED2** camera on the Jetson (visual-inertial). The IMU message
+  type (`0x06`) and the IMU sensor-enable bit are kept **reserved-unused** so the
+  protocol numbering stays stable.
+- A rate cap in `config.h` (`SENSOR_MAG_HZ`) keeps the mag from flooding the UART.
+- A sensor-enable bitmask (PC→ESP32) turns sensors on/off at runtime. With gas,
+  thermal and the IMU gone from the ESP32, only the **mag** bit is meaningful.
 
 ---
 
@@ -384,11 +385,15 @@ fault recovery and a cross-core SPI mutex for the MCP2515 path.
 - Status parsed from the VESC's broadcast frames (big-endian):
   - Status 1 (cmd 9): eRPM, motor current, duty cycle.
   - Status 4 (cmd 16): FET temp, motor temp.
-  - Status 5 (cmd 27): tachometer (int32 at data[0..3]) + input voltage.
-    (Flipper *position* now comes from the lisp's `0x7F` report, not this
-    tachometer.) Enable status frames 1/4/5 in VESC Tool for traction/temp/voltage
-    telemetry. The ESP gates each status frame by per-command DLC, not `== 8`.
-- Forwarded to the PC as `MSG_VESC_STATUS` (0x08).
+  - Status 5 (cmd 27): tachometer (int32 at data[0..3]) + input voltage. The
+    tachometer is **forwarded** in `MSG_VESC_STATUS`; the two **traction** VESCs'
+    counts are integrated into **track (wheel) odometry** on the Jetson bridge
+    (`/odom/wheel`). (Flipper *position* still comes from the lisp's `0x7F` report,
+    not this tachometer.) Enable status frames 1/4/5 in VESC Tool for traction/
+    temp/voltage/tachometer telemetry. The ESP gates each status frame by
+    per-command DLC, not `== 8`.
+- Forwarded to the PC as `MSG_VESC_STATUS` (0x08), which now carries the
+  tachometer alongside eRPM/current/duty/temps/voltage.
 - **CAN IDs** (from `1.ino`/`2.ino`, set in VESC Tool — need **not** be contiguous;
   the firmware maps id → array index by lookup): traction **L=60, R=50**; flippers
   **FL=20, FR=10, RL=40, RR=30**. Only the four flipper VESCs run the lisp.
@@ -456,23 +461,24 @@ firmware (`robot_types.h`) and the bridge (Python `struct`).
 | 0x01 | Telemetry | mode, flags, raw PPM[6], speed_l/r (eRPM-derived ×10), flipper angle ×10, uptime |
 | 0x03 | Magnetometer | XYZ int16 (µT ×100) |
 | 0x05 | Status | mode, flags, sensor mask |
-| 0x06 | IMU | Euler ×10, accel ×100, gyro ×1000, calib byte |
 | 0x07 | Encoder ext | 4 flipper angles ×10 (FL, FR, RL, RR) |
-| 0x08 | VESC status | per-VESC: id, eRPM, current, duty, FET/motor temp, V_in |
+| 0x08 | VESC status | per-VESC: id, eRPM, current, duty, FET/motor temp, V_in, **tachometer** |
 | 0x0A | ODrive status | per-joint: idx, pos, vel, Iq, bus V, bus I |
 | 0x0B | LKTech status | per-joint (J5/J6) telemetry |
 | 0x0C | ZE300 status | J4 telemetry |
 | 0x0D | ODrive error | per-node motor_error (optional) |
 
 > Removed vs. legacy: **0x02 Thermal** (now a Jetson node), **0x04 Gas** (sensor
-> dropped), **0x09 Motor-main** (was `ROBOT_MAIN`-only PWM duties — N/A here).
+> dropped), **0x06 IMU** (BNO055 removed — orientation comes from the ZED2),
+> **0x09 Motor-main** (was `ROBOT_MAIN`-only PWM duties — N/A here). Their type
+> numbers are kept reserved so the GUI/bridge numbering stays stable.
 
 ### 9.2 PC → ESP32
 
 | Type | Name | Payload |
 |------|------|---------|
 | 0x10 | Arm joints | 6 × int16 (deg ×100) — computed on the workstation |
-| 0x11 | Sensor enable | 1-byte bitmask (mag, imu) |
+| 0x11 | Sensor enable | 1-byte bitmask (mag; imu/thermal/gas bits reserved-unused) |
 | 0x12 | E-stop | (empty) — immediate stop |
 | 0x13 | E-stop clear | (empty) — resume |
 | 0x14 | Keybind | 15 bytes (3 modes × 5 channel slots) |
@@ -491,8 +497,11 @@ hardware and the operator network. Planned nodes:
 - **`esp32_bridge`** (Python). Owns `/dev/ttyUSB*` to the ESP32. Parses the
   binary protocol into ROS topics and serializes inbound topics back into
   frames. This is the heart of the relay. (Direct port of the legacy
-  `esp32_bridge/main_bridge.py`, trimmed: no thermal/gas, traction speed comes
-  from VESC status.)
+  `esp32_bridge/main_bridge.py`, trimmed: no thermal/gas, **no IMU** — traction
+  speed comes from VESC status.) It also **integrates the two traction VESCs'
+  tachometers into track wheel odometry**, published as `nav_msgs/Odometry` on
+  `/odom/wheel` (with skid-steer covariances; **no TF** — the EKF owns
+  `odom→base_link`). Wheel/track geometry is set via node parameters.
 - **`thermal_camera`** (Python). Reads the MLX90640 over the Jetson's I2C GPIO
   and publishes `/sensors/thermal` as a 32×24 `sensor_msgs/Image` (°C float).
   *New on the Jetson — was on the ESP32 in legacy.*
@@ -502,10 +511,12 @@ hardware and the operator network. Planned nodes:
   the workstation GUI. The Orin Nano has **no NVENC**, so nothing is *encoded* on
   the Jetson — the C920 encodes H.264 itself and the Jetson just packetizes
   (near-zero CPU). See §11.1 and the gui README.
-- **`rescue_nav`** *(future, deferred)*. ZED2 driver (VIO odometry in
+- **`rescue_nav`** *(future, deferred)*. ZED2 driver (VIO odometry **and IMU** in
   `zed_camera_link`), RPLidar A2M12 (`sllidar_ros2`), a static
   `zed_camera_link → laser` transform, and `slam_toolbox` publishing
-  `map → odom`. Hardware is present now; the stack is not yet implemented.
+  `map → odom`. It will also host the **`robot_localization` EKF** that fuses the
+  bridge's `/odom/wheel` with the ZED2 IMU + VIO into a filtered `odom → base_link`
+  (see §18). Hardware is present now; the stack is not yet implemented.
 
 The Jetson does **not** handle the RF cameras (they go straight to the
 workstation) and does **not** run the GUI or arm IK.
@@ -566,8 +577,8 @@ both are visible at once under the twin.)
 | `SourceManager` | Discovers sources: local webcams (`probeLocalCameras`), the configured **C920 SRT streams** (from `AppSettings`), and thermal ROS topics (`probeThermalTopics` + a `/config` subscription). Emits `sourcesUpdated`. |
 | `VideoPanel` / `VideoWidget` | 2×2 grid of feeds; click-to-enlarge; each widget runs its own filter pipeline on a worker thread and can select any source (incl. thermal). An enlarged cell supports **zoom + pan** (on-screen +/−/Fit buttons or Ctrl+scroll to zoom — trackpad pinch only on Wayland, not X11; two-finger scroll / drag to pan), applied as an ROI crop+upscale of the source frame **before** the filter pipeline (so the CV runs on the zoomed region); resets to fit on collapse. |
 | `FilterRegistry` / `filters` | Self-registering CV filters with a thread-safe `FilterConfig` (atomics). Per-widget instances. |
-| `OdometryPanel` | Track speeds, 4 flipper angles, **per-VESC rows (the six VESC IDs)**, and arm telemetry (ODrive/LKTech/ZE300). |
-| `DashboardPanel` | Connection LED + heartbeat, magnetometer + IMU readouts, **e-stop button**, sensor-enable toggles, audio toggle, settings button. |
+| `OdometryPanel` | Track speeds, **track wheel-odometry (x/y/yaw/vx from `/odom/wheel`)**, 4 flipper angles, **per-VESC rows (the six VESC IDs)**, and arm telemetry (ODrive/LKTech/ZE300). |
+| `DashboardPanel` | Connection LED + heartbeat, magnetometer readout (+ enable toggle), **orientation readout from the ZED2 IMU**, **e-stop button**, audio toggle, settings button. |
 | `DigitalTwinPanel` / `UrdfViewer` | OpenGL 3-D view of the arm (+ base) URDF, posed from `/joint_states` (or `/arm/joint_command`). |
 | `GstAvStream` | Native-GStreamer receiver for the front C920's **A/V SRT** stream: `srtsrc ! tsdemux` → video appsink (shown via `CameraHub`) + `opusdec ! tee` → speakers **and** an appsink feeding `SpeechProcessor`. Auto-reconnects. |
 | `SpeechProcessor` | Vosk transcription, fed 16 kHz PCM by `GstAvStream` (the C920 A/V stream's Opus track) via `pushAudio()`. |
@@ -592,16 +603,18 @@ filter is the legacy path.
 
 **Topics:** publishes `/robot/keybind` + `/robot/ppm_calib` (reliable +
 transient-local), `/robot/estop` (Bool, republished ~10 Hz), and
-`/sensors/enable_mask` (UInt8: bit0 mag, bit1 thermal, bit3 imu). Subscribes to
-the telemetry/sensor/motor/mode/flags topics from §12, plus `/sensors/thermal`.
-The C920 video/audio are **not** ROS topics — they arrive over SRT; the
-audio-monitor toggle is a local mute, not a published command.
+`/sensors/enable_mask` (UInt8: bit0 mag, bit1 thermal; imu bit reserved-unused).
+Subscribes to the telemetry/sensor/motor/mode/flags topics from §12, plus
+`/odom/wheel` (track odometry), `/sensors/thermal`, and the **ZED2 IMU** topic
+(orientation readout). The C920 video/audio are **not** ROS topics — they arrive
+over SRT; the audio-monitor toggle is a local mute, not a published command.
 
 **Dicerox-only simplifications vs legacy:**
 - Drop the `robot_type` (Jaguar/Dicerox) switch in `AppSettings`, `OdometryPanel`,
   and the settings dialog — the layout is always the 2-traction + 4-flipper, all-VESC
   drivetrain with the ODrive/ZE300/LKTech arm.
-- Drop the **gas** readout/toggle (no MQ2). Keep magnetometer + IMU.
+- Drop the **gas** readout/toggle (no MQ2). Keep the magnetometer; the orientation
+  readout now comes from the **ZED2 IMU** (no ESP32 IMU, so no IMU enable toggle).
 - Odometry shows the VESC table (6 IDs) + arm telemetry; remove the legacy
   "main motor / PWM duty" section (that was the Jaguar PWM robot).
 - Default keybind table should match the firmware default in
@@ -634,11 +647,11 @@ contract so the GUI and bridge stay compatible.
 | `/robot/ppm` | `Int16MultiArray` | raw PPM µs `[ch1..ch6]` |
 | `/robot/deadband` | `Float32` | normalized deadband (from PPM calib) |
 | `/robot/status` | `DiagnosticArray` | full diagnostic status |
-| `/encoders/tracks` | `Vector3` | x=left_rpm, y=right_rpm |
+| `/encoders/tracks` | `Vector3` | x=left_rpm, y=right_rpm (live track speed) |
 | `/encoders/flipper` | `Float32MultiArray` | `[fl, fr, rl, rr]` degrees |
-| `/sensors/imu` | `Imu` | BNO055 orientation + accel + gyro |
+| `/odom/wheel` | `nav_msgs/Odometry` | track wheel odometry from the traction VESC tachometers (no TF) |
 | `/sensors/mag` | `MagneticField` | LIS3MDL XYZ |
-| `/motors/vesc_status` | `Float32MultiArray` | per-VESC telemetry |
+| `/motors/vesc_status` | `Float32MultiArray` | per-VESC telemetry (incl. tachometer) |
 | `/motors/odrive_status` | `Float32MultiArray` | per-arm-joint telemetry |
 
 ### Published by `thermal_camera` (Jetson)
@@ -653,7 +666,7 @@ contract so the GUI and bridge stay compatible.
 |-------|------|---------|
 | `/robot/estop` | `Bool` | true = e-stop, false = clear |
 | `/arm/joint_command` | `Float32MultiArray` | 6 joint angles (deg) |
-| `/sensors/enable_mask` | `UInt8` | bits: mag, imu |
+| `/sensors/enable_mask` | `UInt8` | bits: mag (imu/thermal/gas reserved-unused) |
 | `/robot/keybind` | `UInt8MultiArray` | 15 bytes (3 modes × 5 channels) |
 | `/robot/ppm_calib` | `UInt16MultiArray` | 6ch × (min, neutral, max) |
 | `/gripper` | `Float32` | gripper command |
@@ -728,9 +741,13 @@ still responds to RC. If the **RC** link drops, the tracks stop and the
 - Arm chain: `base_link → Link1 … Link6` (end effector), from the arm URDF.
   MoveIt Servo's default twist frame is the end-effector link (`Link6` in
   legacy) for local jogging, or `base_link` for world-frame jogging.
-- IMU frame on `base_link` (BNO055 mounting orientation TBD — set in URDF).
-- *(Future nav)* `map → odom → base_link`, with `odom` from ZED2 VIO and a
-  static `zed_camera_link → laser` (RPLidar) transform for `slam_toolbox`.
+- No IMU frame on the ESP32 side. The robot's IMU is the **ZED2's**, on
+  `zed_camera_link` (mounting transform to `base_link` set in the URDF).
+- *(Future nav)* `map → odom → base_link`. `odom → base_link` is owned by the
+  **`robot_localization` EKF** that fuses the bridge's `/odom/wheel` (track
+  tachometers) with the ZED2 IMU + VIO; a static `zed_camera_link → laser`
+  (RPLidar) transform feeds `slam_toolbox` for `map → odom`. The wheel-odometry
+  publisher deliberately does **not** emit a TF (the EKF does).
 
 The digital twin in the GUI consumes the arm URDF + `/arm/joint_command` (or
 `/joint_states`) to render the live pose.
@@ -853,8 +870,8 @@ Things that are **not yet pinned down** and must be resolved on real hardware:
    set `FLIPPER_SOFT_LIMIT_ENABLE` + `FLIPPER_ANGLE_MIN/MAX` (switches the ESP
    target from wrapped to clamped).
 8. **Autonomy (deferred).** ZED2 + RPLidar A2M12 hardware is present; the
-   SLAM/nav stack (`rescue_nav`) is future work. Decide odom source (ZED VIO)
-   and whether to do 2D (`slam_toolbox`) or 3D mapping.
+   SLAM/nav stack (`rescue_nav`) is future work. Odometry fusion is *decided* (see
+   item 12); still open: whether to do 2D (`slam_toolbox`) or 3D mapping.
 9. **Robot/workspace naming.** This doc uses robot-neutral package names
    (`rescue_*`); the legacy used `jaguar_*`/`dicerox`. Pick final names when
    creating packages.
@@ -868,6 +885,18 @@ Things that are **not yet pinned down** and must be resolved on real hardware:
     SRT ports in the GUI settings and `c920_srt_stream.sh`, and bench-test
     bitrate / keyframe interval / SRT latency under a degraded link. CV (YOLO
     hazmat) runs on the clean C920 streams, not the RF driving cams.
+
+12. **Odometry fusion (designed; EKF deferred).** *Decided:* a
+    **`robot_localization` EKF** in `rescue_nav` fuses the bridge's `/odom/wheel`
+    (track tachometers) with the **ZED2** IMU + VIO into a filtered
+    `odom → base_link`. Start with a single `odom`-frame EKF (add the `map`-frame
+    EKF when SLAM lands); `two_d_mode: true`; the ZED driver must run with
+    `publish_tf: false` so it doesn't fight the EKF. *Built now:* only the
+    **EKF-ready** wheel `nav_msgs/Odometry` on `/odom/wheel` (the EKF node/config
+    is the next task). **Bench items:** measure `wheel_circumference_m` and
+    `track_width_m`; set `traction_dir_*` to match `config.h`; confirm the VESC
+    tachometer's steps-per-erev; and tune the skid-steer covariances (forward `vx`
+    trusted, yaw distrusted — heading comes from the ZED2 IMU).
 
 ---
 

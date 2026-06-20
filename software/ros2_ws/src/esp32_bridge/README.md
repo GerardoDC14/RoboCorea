@@ -43,7 +43,9 @@ ros2 launch esp32_bridge esp32_bridge.launch.py serial_port:=/dev/ttyUSB0 baud_r
 
 The node opens the serial port asynchronously and reconnects on unplug. It
 starts with all ESP32 sensors disabled; enable them by publishing a bitmask on
-`/sensors/enable_mask` (bit0 = magnetometer, bit3 = IMU).
+`/sensors/enable_mask` (bit0 = magnetometer; the ESP32 has no IMU — orientation
+comes from the ZED2 camera). It also integrates the two traction VESCs'
+tachometers into track odometry on `/odom/wheel` (`nav_msgs/Odometry`).
 
 ## Topics
 

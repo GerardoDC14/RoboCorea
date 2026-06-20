@@ -10,9 +10,11 @@
 //     the VESC in LispBM; the ESP sends the target angle over a custom frame)
 //   • 3 ODrive (J1–J3) + ZE300 (J4) + 2 LKTech (J5–J6) for the arm
 //
-// Track-speed feedback comes from the VESC CAN status frames (no separate
-// encoders); flipper angle comes from the lisp's 0x7F report. Enable VESC status
-// frames 1/4/5 in VESC Tool for eRPM / temp / input-voltage telemetry.
+// Track feedback comes from the VESC CAN status frames (no separate encoders):
+// eRPM gives live track speed and the STATUS_5 tachometer is forwarded for wheel
+// odometry (integrated on the Jetson bridge). Flipper angle comes from the lisp's
+// 0x7F report. Enable VESC status frames 1/4/5 in VESC Tool for eRPM / temp /
+// input-voltage (+ tachometer) telemetry.
 
 // Arm safety lifecycle state (see config.h "Arm safety lifecycle").
 enum class ArmState : uint8_t { UNINIT = 0, INITIALIZING = 1, READY = 2, FAULT = 3 };

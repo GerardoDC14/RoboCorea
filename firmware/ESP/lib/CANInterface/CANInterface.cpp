@@ -257,7 +257,7 @@ static bool vescSendFlipperTarget(uint8_t id, float wrapped_deg, bool enabled) {
 struct VescFeedback {
     int32_t  erpm;
     int16_t  current_10, duty_1000, temp_fet_10, temp_motor_10, v_in_10;
-    int32_t  tacho;          // STATUS_5 tachometer (telemetry only now)
+    int32_t  tacho;          // STATUS_5 tachometer (forwarded for track odometry)
     bool     fresh;
 };
 static VescFeedback s_vesc[6] = {};
@@ -947,6 +947,7 @@ bool CANInterface::getVescStatus(uint8_t vesc_id, VescStatusPayload& out) {
     out.temp_fet_10   = s_vesc[i].temp_fet_10;
     out.temp_motor_10 = s_vesc[i].temp_motor_10;
     out.v_in_10       = s_vesc[i].v_in_10;
+    out.tachometer    = s_vesc[i].tacho;
     s_vesc[i].fresh   = false;
     portEXIT_CRITICAL(&s_vesc_mux);
     return true;

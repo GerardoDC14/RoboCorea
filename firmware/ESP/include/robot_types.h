@@ -68,15 +68,6 @@ struct ArmJoints {
     bool  valid;
 };
 
-// ─── IMU ─────────────────────────────────────────────────────────────────────
-struct ImuData {
-    float yaw_deg, pitch_deg, roll_deg;       // BNO055 fused Euler (deg)
-    float accel_x, accel_y, accel_z;          // m/s² (gravity-compensated)
-    float gyro_x, gyro_y, gyro_z;             // rad/s
-    uint8_t calib;  // bits[7:6]=sys [5:4]=gyro [3:2]=accel [1:0]=mag (each 0–3)
-    bool valid;
-};
-
 // ─── Magnetometer ─────────────────────────────────────────────────────────────
 struct MagData {
     int  x_uT, y_uT, z_uT;
@@ -121,19 +112,6 @@ struct MagPayload {
     int16_t z_uT100;
 };
 
-struct ImuPayload {
-    int16_t yaw_deg10;             // deg × 10
-    int16_t pitch_deg10;
-    int16_t roll_deg10;
-    int16_t accel_x_ms2_100;       // m/s² × 100
-    int16_t accel_y_ms2_100;
-    int16_t accel_z_ms2_100;
-    int16_t gyro_x_rads1000;       // rad/s × 1000
-    int16_t gyro_y_rads1000;
-    int16_t gyro_z_rads1000;
-    uint8_t calib;
-};
-
 // Four flipper output angles × 10 deg (FL, FR, RL, RR).
 struct EncoderExtPayload {
     int16_t flipper_fl_deg10;
@@ -156,6 +134,10 @@ struct VescStatusPayload {
     int16_t temp_fet_10;           // °C × 10
     int16_t temp_motor_10;         // °C × 10
     int16_t v_in_10;               // V × 10
+    int32_t tachometer;            // VESC STATUS_5 tachometer (commutation steps,
+                                   // signed cumulative). Track wheel odometry is
+                                   // derived from the two traction VESCs' counts on
+                                   // the Jetson bridge (→ /odom/wheel).
 };
 
 // Per-channel RC calibration + global deadband.
@@ -229,9 +211,8 @@ struct ArmLifecyclePayload {
 // a payload without updating the matching struct.unpack/pack format there.
 static_assert(sizeof(TelemetryPayload)   == 24, "TelemetryPayload size");
 static_assert(sizeof(MagPayload)         ==  6, "MagPayload size");
-static_assert(sizeof(ImuPayload)         == 19, "ImuPayload size");
 static_assert(sizeof(EncoderExtPayload)  ==  8, "EncoderExtPayload size");
-static_assert(sizeof(VescStatusPayload)  == 15, "VescStatusPayload size");
+static_assert(sizeof(VescStatusPayload)  == 19, "VescStatusPayload size");
 static_assert(sizeof(OdriveStatusPayload) == 11, "OdriveStatusPayload size");
 static_assert(sizeof(OdriveErrorPayload) ==  9, "OdriveErrorPayload size");
 static_assert(sizeof(LktechStatusPayload) == 11, "LktechStatusPayload size");

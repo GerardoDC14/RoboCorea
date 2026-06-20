@@ -137,21 +137,6 @@ void Comms::sendMagData(const MagData& mag) {
     sendFrame(MSG_SENSOR_MAG, reinterpret_cast<const uint8_t*>(&p), sizeof(p));
 }
 
-void Comms::sendImuData(const ImuData& imu) {
-    ImuPayload p;
-    p.yaw_deg10       = (int16_t)(imu.yaw_deg   * 10.0f);
-    p.pitch_deg10     = (int16_t)(imu.pitch_deg * 10.0f);
-    p.roll_deg10      = (int16_t)(imu.roll_deg  * 10.0f);
-    p.accel_x_ms2_100 = (int16_t)(imu.accel_x * 100.0f);
-    p.accel_y_ms2_100 = (int16_t)(imu.accel_y * 100.0f);
-    p.accel_z_ms2_100 = (int16_t)(imu.accel_z * 100.0f);
-    p.gyro_x_rads1000 = (int16_t)(imu.gyro_x * 1000.0f);
-    p.gyro_y_rads1000 = (int16_t)(imu.gyro_y * 1000.0f);
-    p.gyro_z_rads1000 = (int16_t)(imu.gyro_z * 1000.0f);
-    p.calib           = imu.calib;
-    sendFrame(MSG_SENSOR_IMU, reinterpret_cast<const uint8_t*>(&p), sizeof(p));
-}
-
 void Comms::sendEncoderExt(float fl, float fr, float rl, float rr) {
     EncoderExtPayload p;
     p.flipper_fl_deg10 = (int16_t)(fl * 10.0f);

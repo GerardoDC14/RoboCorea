@@ -54,6 +54,7 @@ class ArmKinematics:
     def __init__(self, urdf_string: str, base: str = 'base_link', tip: str = 'Link6'):
         robot = URDF.from_xml_string(urdf_string)
         by_child = {j.child: j for j in robot.joints}
+        self.base = base
 
         # Trace the kinematic path from tip back to base, then reverse it.
         path, current = [], tip
@@ -71,6 +72,7 @@ class ArmKinematics:
         self.axes = []           # local unit axis for each joint (or None if fixed)
         self.is_actuated = []    # bool per joint in the path
         self.joint_names = []    # name per actuated joint, in order
+        self.child_links = [j.child for j in path]  # link after each joint, in order
         lower, upper = [], []
 
         for j in path:
@@ -116,6 +118,24 @@ class ArmKinematics:
                 T = T @ _axis_rot(self.axes[k], q[qi])
                 qi += 1
         return T, axes_world, p_joints
+
+    def link_poses(self, q: np.ndarray) -> dict:
+        """World 4x4 transform of every link in the chain, keyed by link name.
+
+        Accumulates the same chain as `fk`, but captures each link's pose
+        *after* its parent joint's rotation (i.e. the link's own frame). Used by
+        the self-collision checker to place each link's collision mesh.
+        """
+        T = np.eye(4)
+        poses = {self.base: T.copy()}
+        qi = 0
+        for k, origin in enumerate(self.origins):
+            T = T @ origin
+            if self.is_actuated[k]:
+                T = T @ _axis_rot(self.axes[k], q[qi])
+                qi += 1
+            poses[self.child_links[k]] = T.copy()
+        return poses
 
     def jacobian(self, q: np.ndarray) -> np.ndarray:
         """6 x n_act geometric Jacobian in the base frame.

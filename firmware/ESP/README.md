@@ -2,7 +2,7 @@
 
 PlatformIO project (DOIT ESP32 DevKit V1, custom PCB) that runs the robot's
 real-time I/O: it decodes the RC receiver, drives every motor over a single CAN
-bus, reads the IMU/magnetometer, and talks to the Jetson over USB serial.
+bus, reads the magnetometer, and talks to the Jetson over USB serial.
 
 For the whole-system picture see [`../../reference/architecture.md`](../../reference/architecture.md).
 
@@ -17,7 +17,7 @@ For the whole-system picture see [`../../reference/architecture.md`](../../refer
 | **Traction** | 2 VESCs, differential drive, `SET_RPM` velocity commands. |
 | **Flippers** | 4 VESCs. The **position loop runs on the VESC** (LispBM — see [`../VESC/flipper_position.lisp`](../VESC/flipper_position.lisp)). The ESP integrates the stick into a target angle and sends it over a custom CAN frame; the VESC closes the loop and reports its angle back. Center stick = hold; no separate encoders. |
 | **Arm relay** | In ARM mode the tracks stop and the latest joint command from the PC is sent to the arm motors over CAN: ODrive J1–J3, ZE300 J4, LKTech J5–J6. |
-| **Sensors** | BNO055 IMU + LIS3MDL magnetometer over I2C. (The thermal camera is on the Jetson; there is no gas sensor.) |
+| **Sensors** | LIS3MDL magnetometer over I2C. (No IMU on the ESP32 — orientation comes from the ZED2 camera on the Jetson; the thermal camera is on the Jetson; there is no gas sensor.) |
 | **Protocol** | Binary UART at 921600 baud to the Jetson. Telemetry at 50 Hz; the PC sends arm joints, keybinds, PPM calibration, sensor-enable, and e-stop. |
 
 ---
@@ -27,7 +27,7 @@ For the whole-system picture see [`../../reference/architecture.md`](../../refer
 | Core | Task | Rate | Prio | Purpose |
 |------|------|------|------|---------|
 | 1 | `controlTask` | 50 Hz | 5 | State machine, keybinds, flipper setpoint integration, motor output |
-| 1 | `sensorTask`  | ~50 Hz | 2 | BNO055 + LIS3MDL sampling |
+| 1 | `sensorTask`  | ~50 Hz | 2 | LIS3MDL magnetometer sampling |
 | 0 | `commsTask`   | 50 Hz | 4 | UART RX parse + telemetry/sensor/motor-status TX |
 | 0 | `canTask`     | 200 Hz | 4 | CAN drain + ODrive telemetry RTRs + bus-health recovery |
 
@@ -105,10 +105,10 @@ and must stay in sync with the Jetson bridge `struct` formats.
 | Dir | Type | Name |
 |-----|------|------|
 | → PC | 0x01 | Telemetry (mode, flags, PPM[6], track speeds, flipper angle, uptime) |
-| → PC | 0x03 / 0x06 | Magnetometer / IMU |
+| → PC | 0x03 | Magnetometer |
 | → PC | 0x05 | Status |
 | → PC | 0x07 | Flipper angles (FL,FR,RL,RR) |
-| → PC | 0x08 | VESC status |
+| → PC | 0x08 | VESC status (incl. tachometer → track odometry) |
 | → PC | 0x0A / 0x0B / 0x0C / 0x0D | ODrive / LKTech / ZE300 status, ODrive error |
 | ← PC | 0x10 | Arm joints (6 × int16 deg×100) |
 | ← PC | 0x11 | Sensor enable mask |
@@ -117,8 +117,9 @@ and must stay in sync with the Jetson bridge `struct` formats.
 | ← PC | 0x15 | PPM calibration |
 | ← PC | 0x16 | Gripper (→ PC originates; reserved) |
 
-(0x02 thermal, 0x04 gas, 0x09 main-PWM are reserved-unused on this robot but the
-numbering is kept stable for GUI compatibility.)
+(0x02 thermal, 0x04 gas, 0x06 IMU, 0x09 main-PWM are reserved-unused on this robot
+but the numbering is kept stable for GUI compatibility. Orientation now comes from
+the ZED2 camera on the Jetson, not the ESP32.)
 
 ---
 
@@ -144,7 +145,7 @@ lib/      RC/             PPM decode (ISR) + calibration
           Locomotion/     drivetrain output (track mix + flipper angle/hold)
           CANInterface/   CAN HAL (MCP2515/TWAI) + VESC/ODrive/ZE300/LKTech
           Comms/          binary UART protocol
-          Sensors/        BNO055 + LIS3MDL
+          Sensors/        LIS3MDL magnetometer
           PID/            reusable PID (linear + shortest-angle) — spare
 src/      main.cpp        setup() + FreeRTOS tasks
 

@@ -19,14 +19,15 @@
 class QTextEdit;
 class SpeechProcessor;
 
-// Right-column dashboard: connection/heartbeat + uptime, magnetometer and IMU
-// readouts with per-sensor enable toggles, the software e-stop, and the speech
-// transcription panel + audio-monitor toggle.
+// Right-column dashboard: connection/heartbeat + uptime, a magnetometer readout
+// with an enable toggle, an orientation readout (from the ZED2 IMU), the software
+// e-stop, and the speech transcription panel + audio-monitor toggle.
 //
-// RoboCorea changes vs legacy: no gas sensor. Audio is the Opus track demuxed
-// from the C920 A/V stream (fed to the SpeechProcessor by MainWindow), not a ROS
-// topic. Sensor-enable mask bits: bit0 mag, bit1 thermal (driven by the video
-// panel's thermal selection, not a button), bit3 imu.
+// RoboCorea changes vs legacy: no gas sensor; no ESP32 IMU (orientation comes
+// from the ZED2 camera, so it has no enable toggle). Audio is the Opus track
+// demuxed from the C920 A/V stream (fed to the SpeechProcessor by MainWindow),
+// not a ROS topic. Sensor-enable mask bits: bit0 mag, bit1 thermal (driven by the
+// video panel's thermal selection, not a button).
 class DashboardPanel : public QWidget {
     Q_OBJECT
 public:
@@ -83,7 +84,7 @@ private:
     QLabel* mag_y_;
     QLabel* mag_z_;
 
-    // IMU orientation
+    // Orientation (from the ZED2 IMU)
     QLabel* imu_yaw_;
     QLabel* imu_pitch_;
     QLabel* imu_roll_;
@@ -96,9 +97,8 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::MagneticField>::SharedPtr mag_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
 
-    // Sensor enable mask toggles (bit0=mag, bit1=thermal, bit3=imu).
+    // Sensor enable mask toggles (bit0=mag, bit1=thermal driven by the video panel).
     QPushButton* mag_toggle_;
-    QPushButton* imu_toggle_;
     uint8_t      sensor_mask_{0};
     rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr sensor_mask_pub_;
 

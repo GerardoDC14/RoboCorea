@@ -15,9 +15,10 @@
 //
 // See reference/architecture.md for the full system picture.
 
-// ─── I2C (BNO055 IMU + LIS3MDL magnetometer) ─────────────────────────────────
+// ─── I2C (LIS3MDL magnetometer) ──────────────────────────────────────────────
 // Pins per 1.ino/2.ino (the working board). The on-board magnetometer is a
-// LIS3MDL and the Sensors lib uses the Adafruit LIS3MDL driver.
+// LIS3MDL and the Sensors lib uses the Adafruit LIS3MDL driver. There is no IMU
+// on the ESP32 — orientation comes from the ZED2 camera on the Jetson.
 #define PIN_I2C_SDA          21
 #define PIN_I2C_SCL          22
 
@@ -241,20 +242,19 @@
 #define ARM_RAMP_MAX_ACC_DPS2  { 37.5f, 30.0f, 30.0f, 75.0f, 75.0f, 75.0f }
 
 // ─── Sensors ─────────────────────────────────────────────────────────────────
-// Only the IMU (BNO055) and magnetometer (LIS3MDL) live on the ESP32. The
-// MLX90640 thermal camera is on the Jetson; the legacy MQ2 gas sensor is removed.
-#define BNO055_I2C_ADDR      0x28      // SA0=GND; 0x29 if SA0=VCC
-                                       // LIS3MDL uses the Adafruit driver's default address
+// Only the magnetometer (LIS3MDL) lives on the ESP32. The MLX90640 thermal
+// camera is on the Jetson; the legacy MQ2 gas sensor is removed; orientation
+// comes from the ZED2 camera on the Jetson (no IMU on the ESP32).
+// The LIS3MDL uses the Adafruit driver's default I2C address.
 
-// Sensor-enable bitmask bits (PC → ESP32). Thermal/gas bits are reserved but
-// unused on this robot; only MAG and IMU do anything.
+// Sensor-enable bitmask bits (PC → ESP32). Thermal/gas/IMU bits are reserved but
+// unused on this robot; only MAG does anything.
 #define SENSOR_BIT_MAG       (1 << 0)
 #define SENSOR_BIT_THERMAL   (1 << 1)  // reserved (handled on the Jetson)
 #define SENSOR_BIT_GAS       (1 << 2)  // reserved (sensor removed)
-#define SENSOR_BIT_IMU       (1 << 3)
+#define SENSOR_BIT_IMU       (1 << 3)  // reserved (no IMU on the ESP32; orientation from ZED2)
 
 #define SENSOR_MAG_HZ           50
-#define SENSOR_IMU_HZ           50
 
 // ─── Jetson binary protocol ──────────────────────────────────────────────────
 // Frame: [0xAA][0x55][TYPE:1][LEN_H:1][LEN_L:1][PAYLOAD:LEN][CRC:1]
@@ -271,9 +271,9 @@
 #define MSG_SENSOR_MAG       0x03      // LIS3MDL XYZ
 #define MSG_SENSOR_GAS       0x04      // reserved (sensor removed)
 #define MSG_STATUS           0x05      // system status / heartbeat
-#define MSG_SENSOR_IMU       0x06      // BNO055 orientation + accel + gyro
+#define MSG_SENSOR_IMU       0x06      // reserved (no IMU on the ESP32; orientation from ZED2)
 #define MSG_ENCODER_EXT      0x07      // 4 flipper output angles (FL,FR,RL,RR)
-#define MSG_VESC_STATUS      0x08      // per-VESC feedback
+#define MSG_VESC_STATUS      0x08      // per-VESC feedback (incl. tachometer for track odometry)
 #define MSG_MOTOR_MAIN       0x09      // reserved (was ROBOT_MAIN PWM duties)
 #define MSG_ODRIVE_STATUS    0x0A      // arm J1–J3 telemetry
 #define MSG_LKTECH_STATUS    0x0B      // arm J5–J6 telemetry
