@@ -27,10 +27,10 @@ class SpeechProcessor;
 // e-stop, and the speech transcription panel + audio-monitor toggle.
 //
 // RoboCorea changes vs legacy: no gas sensor; no ESP32 IMU (orientation comes
-// from the ZED2 camera, so it has no enable toggle). Audio is the Opus track
-// demuxed from the C920 A/V stream (fed to the SpeechProcessor by MainWindow),
-// not a ROS topic. Sensor-enable mask bits: bit0 mag, bit1 thermal (driven by the
-// video panel's thermal selection, not a button).
+// from the ZED2 camera, so it has no enable toggle). The magnetometer and thermal
+// camera are Jetson I2C nodes that honor /sensors/enable_mask: bit0 mag, bit1
+// thermal (driven by the video panel's thermal selection, not a button). Audio is
+// the Opus track demuxed from the C920 A/V stream, not a ROS topic.
 class DashboardPanel : public QWidget {
     Q_OBJECT
 public:

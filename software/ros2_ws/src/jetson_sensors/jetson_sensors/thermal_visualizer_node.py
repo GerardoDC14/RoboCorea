@@ -5,7 +5,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 
-from mlx90640_ros2.common import HEIGHT, WIDTH, sensor_qos
+from jetson_sensors.common import HEIGHT, WIDTH, sensor_qos
 
 
 def image_to_array(msg: Image) -> np.ndarray:
@@ -90,8 +90,8 @@ def rgb_message(rgb: np.ndarray, source: Image) -> Image:
 class ThermalVisualizerNode(Node):
     def __init__(self) -> None:
         super().__init__('thermal_visualizer_node')
-        self.declare_parameter('input_topic', 'thermal/image_filtered')
-        self.declare_parameter('output_topic', 'thermal/image_color')
+        self.declare_parameter('input_topic', '/sensors/thermal')
+        self.declare_parameter('output_topic', '/sensors/thermal_color')
         self.declare_parameter('visualization_scale', 10)
         self.declare_parameter('gaussian_sigma', 0.0)
         self.declare_parameter('auto_scale', True)

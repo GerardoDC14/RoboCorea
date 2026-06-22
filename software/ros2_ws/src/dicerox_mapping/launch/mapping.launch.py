@@ -32,6 +32,7 @@ def generate_launch_description():
     slam_scan_topic = LaunchConfiguration('slam_scan_topic')
     laser_frame = LaunchConfiguration('laser_frame')
     use_rviz = LaunchConfiguration('use_rviz')
+    publish_odom_tf = LaunchConfiguration('publish_odom_tf')
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -58,6 +59,10 @@ def generate_launch_description():
         DeclareLaunchArgument('slam_scan_topic', default_value='/scan_flat'),
         DeclareLaunchArgument('laser_frame', default_value='base_laser'),
         DeclareLaunchArgument('use_rviz', default_value='true'),
+        # Set false to let an external node (e.g. the robot_localization EKF in
+        # rescue_nav) own odom -> base_footprint; zed_planar_odom then only
+        # publishes /filtered_odom as a fusion source. See rescue_nav.
+        DeclareLaunchArgument('publish_odom_tf', default_value='true'),
 
         Node(
             package='dicerox_mapping',
@@ -78,7 +83,7 @@ def generate_launch_description():
                 'yaw_deadband': ParameterValue(yaw_deadband, value_type=float),
                 'max_yaw_rate': ParameterValue(max_yaw_rate, value_type=float),
                 'tf_time_offset': ParameterValue(tf_time_offset, value_type=float),
-                'publish_tf': True,
+                'publish_tf': ParameterValue(publish_odom_tf, value_type=bool),
             }],
         ),
 

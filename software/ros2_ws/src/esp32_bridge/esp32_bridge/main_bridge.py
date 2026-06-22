@@ -4,11 +4,11 @@ RoboCorea ESP32 ⇄ ROS 2 bridge (Jetson side)
 Runs on the Jetson Orin Nano. Owns one or two USB-serial links to identical
 ESP32 PCBs and routes frames by the board identity announced by firmware:
 
-  * CHASSIS PCB: RC/PPM, traction, flippers, wheel odometry, magnetometer.
+  * CHASSIS PCB: RC/PPM, traction, flippers, wheel odometry.
   * ARM PCB: arm lifecycle, joint commands, and mixed-CAN arm telemetry.
 
 The public ROS API intentionally stays the same as the old one-PCB bridge:
-chassis data appears on /robot, /encoders, /odom, /sensors, and /motors/vesc_*;
+chassis data appears on /robot, /encoders, /odom, and /motors/vesc_*;
 arm data appears on /arm and the arm motor topics.
 """
 
@@ -32,9 +32,9 @@ from std_msgs.msg import (
     Bool, String, UInt8, UInt16, Float32, Float32MultiArray,
     Int16MultiArray, UInt16MultiArray,
 )
-from sensor_msgs.msg import MagneticField, JointState
+from sensor_msgs.msg import JointState
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Vector3
+from geometry_msgs.msg import Vector3, Twist
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from std_srvs.srv import Trigger
 
@@ -53,19 +53,19 @@ from .protocol import (
     MSG_ESTOP_CLEAR,
     MSG_GRIPPER,
     MSG_LKTECH_STATUS,
-    MSG_MAG,
     MSG_ODRIVE_ERROR,
     MSG_ODRIVE_STATUS,
     MSG_PPM_CALIB,
-    MSG_SENSOR_ENABLE,
     MSG_STATUS,
     MSG_TELEMETRY,
+    MSG_TRACTION_CMD,
     MSG_VESC_STATUS,
     MSG_ZE300_STATUS,
     ChassisEstopMirror,
     FrameParser,
     RoleRouteTable,
     build_frame,
+    build_traction_cmd,
     parse_identity,
 )
 
@@ -233,14 +233,23 @@ class ESP32BridgeNode(Node):
         self.declare_parameter('traction_id_right', 50)
         self.declare_parameter('traction_dir_left', 1.0)
         self.declare_parameter('traction_dir_right', 1.0)
-        self.declare_parameter('wheel_circumference_m', 0.5)
-        self.declare_parameter('track_width_m', 0.4)
+        self.declare_parameter('wheel_circumference_m', 0.707)
+        self.declare_parameter('track_width_m', 0.455)
         self.declare_parameter('motor_pole_pairs', 7)
-        self.declare_parameter('gear_ratio', 100.0)
+        self.declare_parameter('gear_ratio', 23.333)
         self.declare_parameter('tacho_steps_per_erev', 6.0)
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('odom_child_frame', 'base_link')
         self.declare_parameter('odom_rate_hz', 50.0)
+
+        # External traction (Nav2 /cmd_vel) → MSG_TRACTION_CMD. Disabled by default:
+        # the bridge will NOT command the tracks unless explicitly enabled (safety).
+        self.declare_parameter('enable_cmd_vel_drive', False)
+        # Linear speed (m/s) that maps to normalised 1.0; should match the firmware's
+        # TRACTION_ERPM_MAX. Conservative default — bench-calibrate (Nav2 closes the
+        # loop on odometry, so an approximate value still reaches goals).
+        self.declare_parameter('max_track_speed_mps', 1.0)
+        self.declare_parameter('cmd_vel_timeout', 0.3)
 
         self._trac_id_l = int(self.get_parameter('traction_id_left').value)
         self._trac_id_r = int(self.get_parameter('traction_id_right').value)
@@ -254,6 +263,12 @@ class ESP32BridgeNode(Node):
         self._odom_frame = str(self.get_parameter('odom_frame').value)
         self._odom_child_frame = str(self.get_parameter('odom_child_frame').value)
         self._odom_rate_hz = float(self.get_parameter('odom_rate_hz').value)
+
+        self._cmd_vel_enabled = bool(self.get_parameter('enable_cmd_vel_drive').value)
+        self._max_track_speed = float(self.get_parameter('max_track_speed_mps').value)
+        self._cmd_vel_timeout = float(self.get_parameter('cmd_vel_timeout').value)
+        self._cmd_vel_last_t = None
+        self._cmd_vel_released = True
 
         self._track_dist = {'L': None, 'R': None}
         self._track_zero = {'L': None, 'R': None}
@@ -280,7 +295,6 @@ class ESP32BridgeNode(Node):
         self._pub_tracks = self.create_publisher(Vector3, '/encoders/tracks', sensor_qos)
         self._pub_flipper = self.create_publisher(Float32MultiArray, '/encoders/flipper', sensor_qos)
         self._pub_wheel_odom = self.create_publisher(Odometry, '/odom/wheel', sensor_qos)
-        self._pub_mag = self.create_publisher(MagneticField, '/sensors/mag', sensor_qos)
         self._pub_vesc = self.create_publisher(Float32MultiArray, '/motors/vesc_status', sensor_qos)
         self._pub_odrive = self.create_publisher(Float32MultiArray, '/motors/odrive_status', sensor_qos)
         self._pub_lktech = self.create_publisher(Float32MultiArray, '/motors/lktech_status', sensor_qos)
@@ -304,12 +318,17 @@ class ESP32BridgeNode(Node):
         # Subscribers
         self.create_subscription(Bool, '/robot/estop', self._on_estop, 10)
         self.create_subscription(JointState, '/joint_states', self._on_joint_states, 10)
-        self.create_subscription(UInt8, '/sensors/enable_mask', self._on_sensor_enable, 10)
         self.create_subscription(UInt16MultiArray, '/robot/ppm_calib', self._on_ppm_calib, latched_qos)
+        if self._cmd_vel_enabled:
+            self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
+            # Watchdog: release the tracks back to RC if /cmd_vel goes stale.
+            self.create_timer(0.1, self._cmd_vel_watchdog)
+            self.get_logger().warn(
+                'enable_cmd_vel_drive=true: /cmd_vel will command the traction VESCs '
+                f'(max {self._max_track_speed:.2f} m/s = full scale)')
 
         self._chassis_handlers = {
             MSG_TELEMETRY: self._handle_telemetry,
-            MSG_MAG: self._handle_mag,
             MSG_STATUS: self._handle_status,
             MSG_ENCODER_EXT: self._handle_encoder_ext,
             MSG_VESC_STATUS: self._handle_vesc_status,
@@ -329,7 +348,6 @@ class ESP32BridgeNode(Node):
         self._estop_mirror = ChassisEstopMirror()
         self._software_estop_active = None
         self._last_missing_role_log: dict[tuple[int, str], float] = {}
-        self._last_sensor_mask = 0
 
         rate = self._odom_rate_hz if self._odom_rate_hz > 0.0 else 50.0
         self._odom_timer = self.create_timer(1.0 / rate, self._integrate_wheel_odom)
@@ -446,7 +464,6 @@ class ESP32BridgeNode(Node):
                 f'(protocol={identity.protocol_version}, caps=0x{identity.capabilities:04X})')
 
         if identity.role == ROLE_CHASSIS:
-            link.send(build_frame(MSG_SENSOR_ENABLE, bytes([self._last_sensor_mask])))
             if self._software_estop_active:
                 link.send(build_frame(MSG_ESTOP, b''))
         elif identity.role == ROLE_ARM:
@@ -538,19 +555,6 @@ class ESP32BridgeNode(Node):
         msg = Float32MultiArray()
         msg.data = [fl / 10.0, fr / 10.0, rl / 10.0, rr / 10.0]
         self._pub_flipper.publish(msg)
-
-    def _handle_mag(self, payload: bytes):
-        fmt = '<hhh'
-        if len(payload) < struct.calcsize(fmt):
-            return
-        x, y, z = struct.unpack_from(fmt, payload)
-        msg = MagneticField()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'mag_link'
-        msg.magnetic_field.x = float(x)
-        msg.magnetic_field.y = float(y)
-        msg.magnetic_field.z = float(z)
-        self._pub_mag.publish(msg)
 
     def _handle_vesc_status(self, payload: bytes):
         fmt = '<Bihhhhhi'
@@ -819,14 +823,32 @@ class ESP32BridgeNode(Node):
         payload = struct.pack('<' + 'h' * 6, *[int(d * 100.0) for d in degs])
         self._send_to_role(ROLE_ARM, build_frame(MSG_ARM_JOINTS, payload), 'joint state forwarding')
 
-    def _on_sensor_enable(self, msg: UInt8):
-        self._last_sensor_mask = int(msg.data) & 0xFF
-        self._send_to_role(
-            ROLE_CHASSIS,
-            build_frame(MSG_SENSOR_ENABLE, bytes([self._last_sensor_mask])),
-            'sensor enable',
-        )
-        self.get_logger().info(f'Sensor enable mask: 0x{self._last_sensor_mask:02X}')
+    def _on_cmd_vel(self, msg: Twist):
+        # Differential mixing (geometry lives here; the ESP32 reuses the RC path's
+        # eRPM scaling + direction signs). Normalise to [-1,1] against the full-scale
+        # track speed. The ESP32 only acts on this while the RC sticks are neutral.
+        v = msg.linear.x
+        w = msg.angular.z
+        half = 0.5 * self._track_width_m
+        vmax = self._max_track_speed if self._max_track_speed > 1e-6 else 1.0
+        left = (v - w * half) / vmax
+        right = (v + w * half) / vmax
+        self._send_to_role(ROLE_CHASSIS, build_traction_cmd(left, right, True),
+                           'cmd_vel traction', log_missing=False)
+        self._cmd_vel_last_t = time.monotonic()
+        self._cmd_vel_released = False
+
+    def _cmd_vel_watchdog(self):
+        # No fresh /cmd_vel within the timeout → tell the ESP32 to release the tracks
+        # back to RC (sent once per stale period). The firmware also times out on its
+        # own (EXT_DRIVE_TIMEOUT_MS); this is the explicit release.
+        if self._cmd_vel_released:
+            return
+        if (self._cmd_vel_last_t is None
+                or (time.monotonic() - self._cmd_vel_last_t) > self._cmd_vel_timeout):
+            self._send_to_role(ROLE_CHASSIS, build_traction_cmd(0.0, 0.0, False),
+                               'cmd_vel release', log_missing=False)
+            self._cmd_vel_released = True
 
     def _on_ppm_calib(self, msg: UInt16MultiArray):
         if len(msg.data) < 19:

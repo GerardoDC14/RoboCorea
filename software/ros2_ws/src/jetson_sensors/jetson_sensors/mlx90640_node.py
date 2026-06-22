@@ -9,7 +9,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 
-from mlx90640_ros2.common import HEIGHT, WIDTH, sensor_qos
+from jetson_sensors.common import EnableMaskGate, HEIGHT, WIDTH, sensor_qos
 
 
 class ExponentialFilter:
@@ -113,11 +113,14 @@ class Mlx90640Node(Node):
         self.declare_parameter('refresh_rate', 8)
         self.declare_parameter('publish_rate', 8.0)
         self.declare_parameter('frame_id', 'mlx90640_link')
-        self.declare_parameter('raw_topic', 'thermal/image_raw')
-        self.declare_parameter('filtered_topic', 'thermal/image_filtered')
-        self.declare_parameter('status_topic', 'thermal/status')
+        self.declare_parameter('raw_topic', '/sensors/thermal_raw')
+        self.declare_parameter('filtered_topic', '/sensors/thermal')
+        self.declare_parameter('status_topic', '/sensors/thermal_status')
         self.declare_parameter('filter_alpha', 0.55)
         self.declare_parameter('use_dummy', False)
+        self.declare_parameter('enable_mask_topic', '/sensors/enable_mask')
+        self.declare_parameter('enable_mask_bit', 1)
+        self.declare_parameter('start_enabled', True)
 
         bus = int(self.get_parameter('bus').value)
         address = int(self.get_parameter('address').value)
@@ -129,6 +132,9 @@ class Mlx90640Node(Node):
         status_topic = str(self.get_parameter('status_topic').value)
         alpha = float(self.get_parameter('filter_alpha').value)
         use_dummy = bool(self.get_parameter('use_dummy').value)
+        enable_mask_topic = str(self.get_parameter('enable_mask_topic').value)
+        enable_mask_bit = int(self.get_parameter('enable_mask_bit').value)
+        start_enabled = bool(self.get_parameter('start_enabled').value)
 
         if publish_rate <= 0.0:
             raise ValueError('publish_rate must be greater than zero')
@@ -151,18 +157,28 @@ class Mlx90640Node(Node):
             status_topic,
             QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE),
         )
+        self.enable_gate = EnableMaskGate(
+            self,
+            enable_mask_topic,
+            enable_mask_bit,
+            start_enabled,
+            'MLX90640',
+        )
         self.timer = self.create_timer(1.0 / publish_rate, self.publish_frame)
         self.sequence = 0
         self.total_read_errors = 0
         self.consecutive_read_errors = 0
         self.last_frame_time = None
         mode = 'dummy' if use_dummy else f'I2C bus {bus}, address {address:#x}'
+        enabled = 'enabled' if self.enable_gate.enabled else 'disabled'
         self.get_logger().info(
-            f'Acquiring at {publish_rate:g} Hz from {mode}; image QoS is '
-            'best-effort/keep-last(1)'
+            f'Acquiring at {publish_rate:g} Hz from {mode}; currently {enabled}; '
+            'image QoS is best-effort/keep-last(1)'
         )
 
     def publish_frame(self) -> None:
+        if not self.enable_gate.enabled:
+            return
         try:
             thermal = self.reader.read()
         except (ValueError, OSError) as exc:

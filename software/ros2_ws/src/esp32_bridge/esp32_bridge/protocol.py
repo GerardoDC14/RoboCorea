@@ -16,7 +16,7 @@ ROLE_NAMES = {
 }
 
 MSG_TELEMETRY = 0x01
-MSG_MAG = 0x03
+MSG_MAG = 0x03  # reserved legacy path; LIS3MDL now publishes from jetson_sensors
 MSG_STATUS = 0x05
 MSG_ENCODER_EXT = 0x07
 MSG_VESC_STATUS = 0x08
@@ -28,7 +28,7 @@ MSG_ARM_LIFECYCLE = 0x0E
 MSG_BOARD_IDENTITY = 0x0F
 
 MSG_ARM_JOINTS = 0x10
-MSG_SENSOR_ENABLE = 0x11
+MSG_SENSOR_ENABLE = 0x11  # reserved legacy path; /sensors/enable_mask stays on Jetson
 MSG_ESTOP = 0x12
 MSG_ESTOP_CLEAR = 0x13
 MSG_KEYBIND = 0x14
@@ -37,11 +37,12 @@ MSG_GRIPPER = 0x16
 MSG_ARM_INIT = 0x17
 MSG_ARM_DISARM = 0x18
 MSG_ARM_MODE = 0x19
+MSG_TRACTION_CMD = 0x1A  # 2×int16 normalised L/R track speed ×1000 + u8 enable (Nav2 /cmd_vel)
 
 CAP_CHASSIS_IO = 1 << 0
 CAP_ARM_IO = 1 << 1
 CAP_RC_PPM = 1 << 2
-CAP_MAG = 1 << 3
+CAP_MAG = 1 << 3  # reserved legacy capability bit
 CAP_VESC_BASE = 1 << 4
 CAP_ARM_CAN = 1 << 5
 
@@ -64,6 +65,19 @@ def build_frame(msg_type: int, payload: bytes) -> bytes:
     for b in payload:
         crc ^= b
     return SOF + bytes([msg_type, len_h, len_l]) + payload + bytes([crc])
+
+
+def build_traction_cmd(left_norm: float, right_norm: float, enable: bool) -> bytes:
+    """External traction command frame (MSG_TRACTION_CMD).
+
+    left/right are normalised track speeds in [-1, 1] (forward positive); they map
+    onto the same VESC eRPM scaling the RC path uses on the ESP32. enable=False
+    releases the tracks back to RC control.
+    """
+    left = max(-1000, min(1000, int(round(left_norm * 1000.0))))
+    right = max(-1000, min(1000, int(round(right_norm * 1000.0))))
+    payload = struct.pack('<hhB', left, right, 1 if enable else 0)
+    return build_frame(MSG_TRACTION_CMD, payload)
 
 
 def parse_identity(payload: bytes) -> BoardIdentity:

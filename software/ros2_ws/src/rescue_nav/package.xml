@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>rescue_nav</name>
+  <version>0.1.0</version>
+  <description>
+    RoboCorea autonomy proof-of-concept: a coherent nav TF tree (base_footprint ->
+    base_link -> laser/zed/imu), a robot_localization EKF (odom -> base_link), 2D
+    SLAM (slam_toolbox) + AMCL localization, the Nav2 stack tuned for the tracked
+    skid-steer base, a Gazebo Classic simulation, and a waypoint runner. Develops
+    against sim; the same launch/config run on the real robot (Jetson + workstation).
+  </description>
+  <maintainer email="nabetse069@gmail.com">arepo</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_simple_commander</exec_depend>
+
+  <!-- Mapping, localization, the TF tree, and the reused scan_frame_republisher /
+       slam_toolbox config all come from dicerox_mapping (we build on it). -->
+  <exec_depend>dicerox_mapping</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
+
+  <!-- Odometry fusion: EKF (odom -> base_footprint) over wheel + ZED VIO + ZED IMU. -->
+  <exec_depend>robot_localization</exec_depend>
+
+  <!-- Simulation (Gazebo Classic). Optional at runtime; only sim.launch needs it. -->
+  <exec_depend>gazebo_ros</exec_depend>
+  <exec_depend>gazebo_plugins</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

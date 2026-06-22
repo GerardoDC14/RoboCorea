@@ -1156,7 +1156,7 @@ void CANInterface::getTractionSpeeds(float& left_rpm, float& right_rpm) {
     int32_t er = (ir >= 0) ? s_vesc[ir].erpm : 0;
     portEXIT_CRITICAL(&s_vesc_mux);
     // eRPM → mechanical motor RPM → output RPM, with direction correction.
-    const float k = 1.0f / ((float)VESC_POLE_PAIRS * DRIVE_GEAR_RATIO);
+    const float k = 1.0f / ((float)VESC_POLE_PAIRS * TRACTION_GEAR_RATIO);
     left_rpm  = el * k * s_traction_dir[0];
     right_rpm = er * k * s_traction_dir[1];
 #endif

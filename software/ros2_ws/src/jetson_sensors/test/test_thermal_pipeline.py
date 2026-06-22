@@ -2,8 +2,9 @@ import numpy as np
 from builtin_interfaces.msg import Time
 from sensor_msgs.msg import Image
 
-from mlx90640_ros2.mlx90640_node import ExponentialFilter, array_to_image
-from mlx90640_ros2.thermal_visualizer_node import (
+from jetson_sensors.lis3mdl_node import magnetic_to_message
+from jetson_sensors.mlx90640_node import ExponentialFilter, array_to_image
+from jetson_sensors.thermal_visualizer_node import (
     bicubic_resize,
     gaussian_blur,
     image_to_array,
@@ -40,3 +41,12 @@ def test_bicubic_visualization_dimensions_and_range():
 def test_gaussian_filter_preserves_constant_image():
     image = np.full((24, 32), 27.5, dtype=np.float32)
     np.testing.assert_allclose(gaussian_blur(image, 0.8), image, atol=1e-5)
+
+
+def test_magnetometer_message_uses_standard_tesla_units():
+    msg = magnetic_to_message((12.0, -34.0, 56.0), Time(sec=3), 'mag_link')
+    assert msg.header.frame_id == 'mag_link'
+    np.testing.assert_allclose(
+        [msg.magnetic_field.x, msg.magnetic_field.y, msg.magnetic_field.z],
+        [12e-6, -34e-6, 56e-6],
+    )

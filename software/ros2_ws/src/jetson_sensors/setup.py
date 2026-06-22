@@ -2,7 +2,7 @@ from glob import glob
 from setuptools import find_packages, setup
 
 
-package_name = 'mlx90640_ros2'
+package_name = 'jetson_sensors'
 
 setup(
     name=package_name,
@@ -18,12 +18,13 @@ setup(
     zip_safe=True,
     maintainer='Gerardo',
     maintainer_email='gerardo@example.com',
-    description='ROS 2 image publisher for the MLX90640 thermal camera.',
+    description='Jetson I2C sensor drivers for RoboCorea thermal and magnetic sensors.',
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'mlx90640_node = mlx90640_ros2.mlx90640_node:main',
-            'thermal_visualizer_node = mlx90640_ros2.thermal_visualizer_node:main',
+            'mlx90640_node = jetson_sensors.mlx90640_node:main',
+            'lis3mdl_node = jetson_sensors.lis3mdl_node:main',
+            'thermal_visualizer_node = jetson_sensors.thermal_visualizer_node:main',
         ],
     },
 )

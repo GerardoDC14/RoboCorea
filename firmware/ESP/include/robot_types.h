@@ -154,6 +154,15 @@ struct GripperPayload {
     int16_t value_1000;            // normalised × 1000 (−1000..+1000)
 };
 
+// External traction command (PC → ESP32). Normalised left/right track speed
+// × 1000 (−1000..+1000); the Jetson bridge derives these from Nav2 /cmd_vel and
+// the wheel/track geometry. enable=0 releases the tracks back to RC control.
+struct TractionCmdPayload {
+    int16_t left_1000;
+    int16_t right_1000;
+    uint8_t enable;
+};
+
 // Board identity. Sent at startup and periodically so the Jetson can discover
 // which USB serial port belongs to the chassis PCB versus the arm PCB.
 struct BoardIdentityPayload {
@@ -189,6 +198,7 @@ static_assert(sizeof(OdriveErrorPayload) ==  9, "OdriveErrorPayload size");
 static_assert(sizeof(LktechStatusPayload) == 11, "LktechStatusPayload size");
 static_assert(sizeof(Ze300StatusPayload) == 14, "Ze300StatusPayload size");
 static_assert(sizeof(GripperPayload)     ==  2, "GripperPayload size");
+static_assert(sizeof(TractionCmdPayload) ==  5, "TractionCmdPayload size");
 static_assert(sizeof(BoardIdentityPayload) == 4, "BoardIdentityPayload size");
 static_assert(sizeof(ArmLifecyclePayload) == 11, "ArmLifecyclePayload size");
 static_assert(sizeof(ArmJointsPayload)   == 12, "ArmJointsPayload size");

@@ -7,11 +7,11 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     config = os.path.join(
-        get_package_share_directory('mlx90640_ros2'), 'config', 'mlx90640.yaml'
+        get_package_share_directory('jetson_sensors'), 'config', 'jetson_sensors.yaml'
     )
     return LaunchDescription([
         Node(
-            package='mlx90640_ros2',
+            package='jetson_sensors',
             executable='thermal_visualizer_node',
             name='thermal_visualizer_node',
             output='screen',

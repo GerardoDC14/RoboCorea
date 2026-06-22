@@ -24,7 +24,7 @@ MainWindow::MainWindow(rclcpp::Node::SharedPtr node, QWidget* parent)
     : QMainWindow(parent), node_(node)
 {
     setWindowTitle("RoboCorea Operator Console");
-    resize(1600, 900);
+    resize(1700, 1100);
 
     AppSettings::instance().load();
 

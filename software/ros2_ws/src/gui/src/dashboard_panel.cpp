@@ -181,8 +181,11 @@ DashboardPanel::DashboardPanel(rclcpp::Node::SharedPtr node, QWidget* parent)
     mag_sub_ = node_->create_subscription<sensor_msgs::msg::MagneticField>(
         "/sensors/mag", sensor_qos,
         [this](sensor_msgs::msg::MagneticField::SharedPtr msg) {
-            emit magnetometerUpdated(msg->magnetic_field.x, msg->magnetic_field.y,
-                                     msg->magnetic_field.z);
+            constexpr double TESLA_TO_MICROTESLA = 1e6;
+            emit magnetometerUpdated(
+                msg->magnetic_field.x * TESLA_TO_MICROTESLA,
+                msg->magnetic_field.y * TESLA_TO_MICROTESLA,
+                msg->magnetic_field.z * TESLA_TO_MICROTESLA);
         });
 
     // Orientation comes from the ZED2 camera's IMU (the deferred ZED/nav stack),

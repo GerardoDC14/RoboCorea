@@ -4,6 +4,7 @@ from esp32_bridge.protocol import (
     MSG_BOARD_IDENTITY,
     MSG_ESTOP,
     MSG_ESTOP_CLEAR,
+    MSG_TRACTION_CMD,
     ROLE_ARM,
     ROLE_CHASSIS,
     BoardIdentity,
@@ -11,6 +12,7 @@ from esp32_bridge.protocol import (
     FrameParser,
     RoleRouteTable,
     build_frame,
+    build_traction_cmd,
     parse_identity,
 )
 
@@ -51,6 +53,22 @@ def test_role_route_table_assigns_and_replaces_roles():
     routes.clear_link(chassis_b)
     assert routes.get(ROLE_CHASSIS) is None
     assert routes.get(ROLE_ARM) is arm
+
+
+def test_build_traction_cmd_roundtrips_and_clamps():
+    parser = FrameParser()
+    # In-range values round-trip through the wire format (×1000, little-endian).
+    parsed = parser.feed(build_traction_cmd(0.5, -0.25, True))
+    assert len(parsed) == 1
+    msg_type, payload = parsed[0]
+    assert msg_type == MSG_TRACTION_CMD
+    left, right, enable = struct.unpack('<hhB', payload)
+    assert (left, right, enable) == (500, -250, 1)
+
+    # Out-of-range speeds clamp to ±1000; enable=False sends 0.
+    _, payload = FrameParser().feed(build_traction_cmd(2.0, -3.0, False))[0]
+    left, right, enable = struct.unpack('<hhB', payload)
+    assert (left, right, enable) == (1000, -1000, 0)
 
 
 def test_chassis_estop_mirror_emits_only_on_transitions():

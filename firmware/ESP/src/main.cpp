@@ -5,12 +5,12 @@
 //   Core 1                              Core 0
 //   ──────────────────────────         ──────────────────────────
 //   controlTask  50 Hz  prio 5         commsTask  50 Hz  prio 4
-//   sensorTask  ~50 Hz  prio 2         canTask   200 Hz  prio 4
+//                                      canTask   200 Hz  prio 4
 //
 // controlTask runs the state machine (RC → mix / flipper-PID / arm-relay).
-// commsTask owns the UART: it parses inbound frames and emits telemetry +
-// sensor + motor-status frames. canTask drains the TWAI bus and emits ODrive
-// telemetry RTRs. sensorTask samples the magnetometer over I2C.
+// commsTask owns the UART: it parses inbound frames and emits telemetry and
+// motor-status frames. canTask drains the TWAI bus and emits ODrive telemetry
+// RTRs. I2C victim-detection sensors live on the Jetson.
 //
 // See reference/architecture.md and the firmware README for details.
 
@@ -19,7 +19,6 @@
 #include "robot_types.h"
 
 #include "RC.h"
-#include "Sensors.h"
 #include "CANInterface.h"
 #include "Locomotion.h"
 #include "Comms.h"
@@ -42,14 +41,6 @@ static void canTask(void*) {
     for (;;) {
         CANInterface::poll();
         vTaskDelayUntil(&last, period);
-    }
-}
-
-// ─── Core 1: magnetometer sampling ────────────────────────────────────────────
-static void sensorTask(void*) {
-    for (;;) {
-        Sensors::runOnce();
-        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
 
@@ -110,10 +101,6 @@ static void commsTask(void*) {
                 Comms::sendStatus(status);
             }
 
-            // ── Sensors (only what's enabled and freshly valid) ────────────
-            uint8_t mask = Sensors::getEnabledMask();
-            if (mask & SENSOR_BIT_MAG) { MagData m; Sensors::getMag(m); if (m.valid) Comms::sendMagData(m); }
-
             // ── Motor status (send only fresh frames) ──────────────────────
             for (uint8_t idx = 0; idx < 6; idx++) {
                 uint8_t id = CANInterface::vescIdByIndex(idx);
@@ -151,9 +138,6 @@ static void commsTask(void*) {
 
 void setup() {
     Comms::begin();          // UART + TX mutex
-#if ROBOCOREA_ROLE_IS_CHASSIS
-    Sensors::begin();        // I2C: LIS3MDL magnetometer
-#endif
     CANInterface::begin();   // TWAI + arm controller bring-up (blocking)
 #if ROBOCOREA_ROLE_IS_CHASSIS
     Locomotion::begin();     // zero the drivetrain VESCs
@@ -169,10 +153,6 @@ void setup() {
                             PRIO_COMMS,   nullptr, TASK_CORE_COMMS);
     xTaskCreatePinnedToCore(canTask,     "can",     STACK_CAN,     nullptr,
                             PRIO_CAN,     nullptr, TASK_CORE_CAN);
-#if ROBOCOREA_ROLE_IS_CHASSIS
-    xTaskCreatePinnedToCore(sensorTask,  "sensor",  STACK_SENSORS, nullptr,
-                            PRIO_SENSORS, nullptr, TASK_CORE_SENSORS);
-#endif
 }
 
 void loop() {

@@ -4,8 +4,9 @@ RoboCorea Jetson-side ROS 2 (Humble) node that bridges two ESP32 binary UART
 links to ROS 2 topics. This is the "relay" core described in
 [`../../../../reference/architecture.md`](../../../../reference/architecture.md):
 it runs on the Jetson Orin Nano, auto-identifies the chassis and arm PCBs from
-their firmware identity frames, publishes telemetry/sensor/motor status, and
-forwards commands to the owning board.
+their firmware identity frames, publishes telemetry and motor status, and
+forwards commands to the owning board. Jetson I2C sensors live in
+`jetson_sensors`; this package is only the USB-serial bridge.
 
 The wire format is the packed binary protocol in the firmware's
 `include/robot_types.h`; the `struct` formats in `main_bridge.py` and constants
@@ -73,16 +74,14 @@ thread is stopped and its role binding cleared — before a fresh link is starte
 so the map cannot leak links or open a re-enumerated board twice. Ports are also
 opened `exclusive` (POSIX flock) as a second guard against a double-open race.
 
-The chassis role publishes `/robot/*`, `/encoders/*`, `/odom/wheel`,
-`/sensors/mag`, and `/motors/vesc_status`. The arm role publishes `/arm/*` plus
-ODrive/LKTech/ZE300 telemetry. Software `/robot/estop` is broadcast to all
-discovered ESP links; chassis RC e-stop transitions are mirrored to the arm ESP
-over the Jetson bridge.
-
-Sensors start disabled; enable them by publishing `/sensors/enable_mask`
-(bit0 = magnetometer; the ESP32 has no IMU — orientation comes from the ZED2).
-The bridge integrates the two traction VESC tachometers into track odometry on
-`/odom/wheel` (`nav_msgs/Odometry`).
+The chassis role publishes `/robot/*`, `/encoders/*`, `/odom/wheel`, and
+`/motors/vesc_status`. The arm role publishes `/arm/*` plus ODrive/LKTech/ZE300
+telemetry. Software `/robot/estop` is broadcast to all discovered ESP links;
+chassis RC e-stop transitions are mirrored to the arm ESP over the Jetson
+bridge. The bridge integrates the two traction VESC tachometers into track
+odometry on `/odom/wheel` (`nav_msgs/Odometry`).
+The odometry `gear_ratio` parameter is the traction reduction, so its default is
+`23.333` to match `TRACTION_GEAR_RATIO` in the ESP firmware.
 
 ## Topics
 
@@ -104,4 +103,4 @@ ros2 run esp32_bridge esp32_bridge --ros-args \
 ```
 
 > Not implemented here (by design): the GUI, computer vision, MoveIt/kinematics,
-> and the thermal-camera node. This package is only the USB-serial bridge.
+> and the Jetson I2C sensor nodes. This package is only the USB-serial bridge.

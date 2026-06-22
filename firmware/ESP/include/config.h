@@ -5,7 +5,7 @@
 // Two identical PCBs run this same firmware. The only intended per-board
 // difference is ROBOCOREA_BOARD_ROLE below:
 //   • CHASSIS owns RC/PPM, traction VESCs, flipper VESCs, wheel-odom VESC
-//     telemetry, and the LIS3MDL magnetometer.
+//     telemetry.
 //   • ARM owns the mixed-CAN arm bus: ODrive J1–J3, ZE300 J4, LKTech J5–J6.
 //
 // Pin numbers below were inherited from the legacy Dicerox bring-up and MUST be
@@ -36,22 +36,22 @@
 #define BOARD_CAP_CHASSIS_IO       (1 << 0)
 #define BOARD_CAP_ARM_IO           (1 << 1)
 #define BOARD_CAP_RC_PPM           (1 << 2)
-#define BOARD_CAP_MAG              (1 << 3)
+#define BOARD_CAP_MAG              (1 << 3)  // reserved; mag is on Jetson I2C
 #define BOARD_CAP_VESC_BASE        (1 << 4)
 #define BOARD_CAP_ARM_CAN          (1 << 5)
 
 #if ROBOCOREA_ROLE_IS_CHASSIS
   #define ROBOCOREA_BOARD_CAPABILITIES \
-    (BOARD_CAP_CHASSIS_IO | BOARD_CAP_RC_PPM | BOARD_CAP_MAG | BOARD_CAP_VESC_BASE)
+    (BOARD_CAP_CHASSIS_IO | BOARD_CAP_RC_PPM | BOARD_CAP_VESC_BASE)
 #else
   #define ROBOCOREA_BOARD_CAPABILITIES \
     (BOARD_CAP_ARM_IO | BOARD_CAP_ARM_CAN)
 #endif
 
-// ─── I2C (LIS3MDL magnetometer) ──────────────────────────────────────────────
-// Pins per 1.ino/2.ino (the working board). The on-board magnetometer is a
-// LIS3MDL and the Sensors lib uses the Adafruit LIS3MDL driver. There is no IMU
-// on the ESP32 — orientation comes from the ZED2 camera on the Jetson.
+// ─── I2C (reserved on ESP32) ─────────────────────────────────────────────────
+// The MLX90640 and LIS3MDL both live on the Jetson I2C bus. These legacy pin
+// constants are kept for bench experiments only; normal firmware does not start
+// an ESP32 I2C sensor task.
 #define PIN_I2C_SDA          21
 #define PIN_I2C_SCL          22
 
@@ -60,10 +60,8 @@
 // backend-agnostic (see lib/CANInterface — it talks through a small HAL).
 //
 // This PCB has an MCP2515 soldered on (SMD, permanent) on the SPI pins below, so
-// MCP2515 is the active backend and GPIO21/22 stay dedicated to I2C. The TWAI
-// backend is kept compilable for a future board; its pins are PLACEHOLDERS —
-// pick real free GPIOs then (21/22 are NOT available, the MCP owns nothing there
-// but the mag does).
+// MCP2515 is the active backend. The TWAI backend is kept compilable for a
+// future board; its pins are PLACEHOLDERS — pick real free GPIOs then.
 #define CAN_BACKEND_MCP2515            // on-board SMD MCP2515 over SPI (default/active)
 // #define CAN_BACKEND_TWAI            // future ESP32 TWAI + SN65HVD230
 
@@ -163,8 +161,9 @@
 #define FLIPPER_DIR_RL        (-1.0f)
 #define FLIPPER_DIR_RR        (1.0f)
 
-// Mechanical reduction (motor → output shaft). Same gearbox on all six motors.
-#define DRIVE_GEAR_RATIO       100.0f
+// Mechanical reduction (motor → output shaft).
+#define TRACTION_GEAR_RATIO     23.333f
+#define FLIPPER_GEAR_RATIO     100.0f
 
 // VESC SET_RPM commands eRPM = mechanical_rpm × pole_pairs.
 // Used to scale traction stick → eRPM and to convert eRPM feedback → output RPM.
@@ -205,7 +204,7 @@
 // Keep the negative scale so downward motion maps to 270 deg after positive
 // modulo 360.
 #define FLIPPER_TACH_SCALE_CAL   (90.0f / 535.0f)
-#define FLIPPER_TACH_BASE_DEG_PER_COUNT  (360.0f / (VESC_POLE_PAIRS * DRIVE_GEAR_RATIO))
+#define FLIPPER_TACH_BASE_DEG_PER_COUNT  (360.0f / (VESC_POLE_PAIRS * FLIPPER_GEAR_RATIO))
 #define FLIPPER_TACH_DEG_PER_COUNT_FL  (-FLIPPER_TACH_BASE_DEG_PER_COUNT * FLIPPER_TACH_SCALE_CAL)
 #define FLIPPER_TACH_DEG_PER_COUNT_FR  (-FLIPPER_TACH_BASE_DEG_PER_COUNT * FLIPPER_TACH_SCALE_CAL)
 #define FLIPPER_TACH_DEG_PER_COUNT_RL  (-FLIPPER_TACH_BASE_DEG_PER_COUNT * FLIPPER_TACH_SCALE_CAL)
@@ -389,14 +388,11 @@
 #define ARM_RAMP_MAX_ACC_DPS2  { 37.5f, 30.0f, 30.0f, 75.0f, 75.0f, 75.0f }
 
 // ─── Sensors ─────────────────────────────────────────────────────────────────
-// Only the magnetometer (LIS3MDL) lives on the ESP32. The MLX90640 thermal
-// camera is on the Jetson; the legacy MQ2 gas sensor is removed; orientation
-// comes from the ZED2 camera on the Jetson (no IMU on the ESP32).
-// The LIS3MDL uses the Adafruit driver's default I2C address.
-
-// Sensor-enable bitmask bits (PC → ESP32). Thermal/gas/IMU bits are reserved but
-// unused on this robot; only MAG does anything.
-#define SENSOR_BIT_MAG       (1 << 0)
+// Passive victim-detection sensors are Jetson-hosted now: LIS3MDL magnetometer
+// and MLX90640 thermal over Linux I2C, with orientation from the ZED2. These
+// mask bits remain reserved so the wire protocol numbering stays stable; the
+// Jetson sensor nodes consume /sensors/enable_mask directly.
+#define SENSOR_BIT_MAG       (1 << 0)  // reserved (handled on the Jetson)
 #define SENSOR_BIT_THERMAL   (1 << 1)  // reserved (handled on the Jetson)
 #define SENSOR_BIT_GAS       (1 << 2)  // reserved (sensor removed)
 #define SENSOR_BIT_IMU       (1 << 3)  // reserved (no IMU on the ESP32; orientation from ZED2)
@@ -411,11 +407,12 @@
 #define PROTO_MAX_PAYLOAD    1600
 
 // ESP32 → PC. (Type numbers kept identical to the legacy protocol so the
-// existing GUI/bridge stay compatible; 0x02 thermal / 0x04 gas / 0x09 main-PWM
+// existing GUI/bridge stay compatible; 0x02 thermal / 0x03 mag / 0x04 gas /
+// 0x09 main-PWM
 // are reserved-unused on this robot.)
 #define MSG_TELEMETRY        0x01      // PPM + state + track speed + flipper angle, 50 Hz
 #define MSG_SENSOR_THERMAL   0x02      // reserved (thermal is published by the Jetson)
-#define MSG_SENSOR_MAG       0x03      // LIS3MDL XYZ
+#define MSG_SENSOR_MAG       0x03      // reserved (magnetometer is published by the Jetson)
 #define MSG_SENSOR_GAS       0x04      // reserved (sensor removed)
 #define MSG_STATUS           0x05      // system status / heartbeat
 #define MSG_SENSOR_IMU       0x06      // reserved (no IMU on the ESP32; orientation from ZED2)
@@ -431,7 +428,7 @@
 
 // PC → ESP32
 #define MSG_ARM_JOINTS       0x10      // 6 × int16 joint angles (deg × 100)
-#define MSG_SENSOR_ENABLE    0x11      // 1-byte bitmask
+#define MSG_SENSOR_ENABLE    0x11      // reserved legacy 1-byte bitmask
 #define MSG_ESTOP            0x12      // 0-byte payload — immediate stop
 #define MSG_ESTOP_CLEAR      0x13      // 0-byte payload — resume
 #define MSG_KEYBIND          0x14      // RESERVED — the per-channel keybind table was
@@ -442,23 +439,28 @@
 #define MSG_ARM_INIT         0x17      // 0-byte — explicit arm/init (passive boot)
 #define MSG_ARM_DISARM       0x18      // 0-byte — disarm the arm motors
 #define MSG_ARM_MODE         0x19      // 1 byte — 0 dexterity, 1 chassis/transport
+#define MSG_TRACTION_CMD     0x1A      // 2×int16 normalised L/R track speed ×1000 + u8 enable
+                                       // (autonomy: the Jetson bridge derives this from Nav2 /cmd_vel)
+
+// External (ROS/Nav2 /cmd_vel) traction command. Autonomy only drives the tracks
+// while the RC link is up, the drive sticks are within deadband, and a fresh
+// command has arrived — touching a stick, engaging virtual-flip, losing the RC
+// link, or letting the command go stale all instantly reclaim manual control.
+#define EXT_DRIVE_TIMEOUT_MS 300       // stale external command → fall back to RC
 
 // ─── FreeRTOS task layout ────────────────────────────────────────────────────
-// Core 0: protocol (comms + CAN).  Core 1: control + sensors.
+// Core 0: protocol (comms + CAN).  Core 1: control.
 #define TASK_CORE_COMMS      0
 #define TASK_CORE_CAN        0
 #define TASK_CORE_CONTROL    1
-#define TASK_CORE_SENSORS    1
 
 #define STACK_CONTROL     5120
 #define STACK_COMMS       4096
 #define STACK_CAN         4096
-#define STACK_SENSORS     4096
 
 #define PRIO_CONTROL         5      // highest — real-time loop
 #define PRIO_COMMS           4
 #define PRIO_CAN             4
-#define PRIO_SENSORS         2      // background
 
 #define CONTROL_LOOP_HZ     50
 #define CAN_POLL_HZ        200

@@ -2,6 +2,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -15,6 +16,9 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'baud_rate', default_value='921600',
             description='UART baud rate (must match MINIPC_BAUD in config.h)'),
+        DeclareLaunchArgument(
+            'gear_ratio', default_value='23.333',
+            description='Traction motor-to-track output reduction for VESC tachometer odometry.'),
         Node(
             package='esp32_bridge',
             executable='esp32_bridge',
@@ -24,6 +28,7 @@ def generate_launch_description():
                 'serial_port': LaunchConfiguration('serial_port'),
                 'serial_candidates': LaunchConfiguration('serial_candidates'),
                 'baud_rate': LaunchConfiguration('baud_rate'),
+                'gear_ratio': ParameterValue(LaunchConfiguration('gear_ratio'), value_type=float),
             }],
         ),
     ])

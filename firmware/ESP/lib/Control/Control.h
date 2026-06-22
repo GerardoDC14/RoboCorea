@@ -29,6 +29,8 @@ public:
     static void clearEstop();
     static void setArmJoints(const ArmJointsPayload& payload);
     static void setSensorMask(uint8_t mask);
+    // External (Nav2 /cmd_vel) traction command, normalised L/R track speed [-1,1].
+    static void setExternalTraction(float left, float right, bool enable);
 
     static RobotMode getMode();
     static void      getSystemStatus(SystemStatus& out);
@@ -49,4 +51,11 @@ private:
     // per-flipper target angle (FL,FR,RL,RR) and send it; HOLD when stick centered.
     static float        s_flip_target[4];
     static bool         s_flip_seeded;    // false → re-seed from measured (bumpless)
+
+    // External (Nav2 /cmd_vel) traction command — used only while the RC drive
+    // sticks are neutral and the command is fresh (see applyControl / config.h).
+    static float        s_ext_left;       // normalised left track speed  [-1,1]
+    static float        s_ext_right;      // normalised right track speed [-1,1]
+    static bool         s_ext_enable;
+    static uint32_t     s_ext_ms;         // millis() of the last external command
 };

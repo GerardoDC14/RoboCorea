@@ -18,6 +18,10 @@ bool         Control::s_virtual_flip  = false;
 float        Control::s_deadband      = 0.05f;
 float        Control::s_flip_target[4] = { 0, 0, 0, 0 };
 bool         Control::s_flip_seeded    = false;
+float        Control::s_ext_left       = 0.0f;
+float        Control::s_ext_right      = 0.0f;
+bool         Control::s_ext_enable     = false;
+uint32_t     Control::s_ext_ms         = 0;
 static bool s_bench_neutral_sent       = false;
 
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -70,6 +74,14 @@ void Control::begin() {
         portENTER_CRITICAL(&s_mux);
         s_deadband = p.deadband_1000 / 1000.0f;
         portEXIT_CRITICAL(&s_mux);
+#else
+        (void)p;
+#endif
+    });
+    Comms::onTraction([](const TractionCmdPayload& p) {
+#if ROBOCOREA_ROLE_IS_CHASSIS
+        Control::setExternalTraction(p.left_1000 / 1000.0f, p.right_1000 / 1000.0f,
+                                     p.enable != 0);
 #else
         (void)p;
 #endif
@@ -203,15 +215,32 @@ void Control::applyControl(const PPMFrame& ppm) {
     if (fabsf(n_fwd)  < kDeadband) n_fwd  = 0.0f;
     if (fabsf(n_turn) < kDeadband) n_turn = 0.0f;
 
-    // ── Traction (Ch3 forward, Ch4 turn) ────────────────────────────────────
-    float fwd = n_fwd, turn = n_turn;
+    // ── Traction (Ch3 forward, Ch4 turn), or autonomy (Nav2 /cmd_vel) ───────
+    // The external command drives the tracks ONLY while the RC drive sticks are
+    // neutral, virtual-flip is off, and the command is fresh. Touching a stick,
+    // engaging virtual-flip, or letting the command go stale instantly returns
+    // control to the operator (RC loss is already handled by the failsafe above).
+    bool rc_traction_neutral = (n_fwd == 0.0f && n_turn == 0.0f);   // already deadbanded
+    bool ext_active = false;
+    float ext_l = 0.0f, ext_r = 0.0f;
+    portENTER_CRITICAL(&s_mux);
+    if (s_ext_enable && (millis() - s_ext_ms) < EXT_DRIVE_TIMEOUT_MS) {
+        ext_active = true; ext_l = s_ext_left; ext_r = s_ext_right;
+    }
+    portEXIT_CRITICAL(&s_mux);
+
+    if (ext_active && rc_traction_neutral && !vflip) {
+        Locomotion::setTrackSpeeds(ext_l, ext_r);   // autonomy drives the tracks
+    } else {
+        float fwd = n_fwd, turn = n_turn;
 #if VFLIP_INVERT_FORWARD
-    if (vflip) fwd = -fwd;
+        if (vflip) fwd = -fwd;
 #endif
 #if VFLIP_INVERT_TURN
-    if (vflip) turn = -turn;
+        if (vflip) turn = -turn;
 #endif
-    Locomotion::setDriveCommand(fwd, turn);
+        Locomotion::setDriveCommand(fwd, turn);
+    }
 
     // ── Flipper selection: Ch5 picks the pair, Ch1 picks left / right / both ─
     // Pair indices into s_flip_target[] (FL=0, FR=1, RL=2, RR=3). Ch5 min → FRONT.
@@ -324,6 +353,21 @@ void Control::setSensorMask(uint8_t mask) {
     Sensors::setEnabledMask(mask);
 #else
     (void)mask;
+#endif
+}
+
+void Control::setExternalTraction(float left, float right, bool enable) {
+#if ROBOCOREA_ROLE_IS_CHASSIS
+    // Stored here; applyControl() arbitrates against the RC sticks every loop and
+    // the freshness check (EXT_DRIVE_TIMEOUT_MS) makes a dropped link fail safe.
+    portENTER_CRITICAL(&s_mux);
+    s_ext_left  = (left  < -1.0f) ? -1.0f : (left  > 1.0f) ? 1.0f : left;
+    s_ext_right = (right < -1.0f) ? -1.0f : (right > 1.0f) ? 1.0f : right;
+    s_ext_enable = enable;
+    s_ext_ms = millis();
+    portEXIT_CRITICAL(&s_mux);
+#else
+    (void)left; (void)right; (void)enable;
 #endif
 }
 

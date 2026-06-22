@@ -14,14 +14,14 @@ For the whole-system picture see [`../../reference/architecture.md`](../../refer
 | Subsystem | Description |
 |-----------|-------------|
 | **RC input** | Decodes a 6-channel PPM stream from the FlySky FS-iA6B on `GPIO4` (ISR). |
-| **Board role** | `ROBOCOREA_BOARD_ROLE_CHASSIS` owns RC, traction, flippers, wheel-odom VESC telemetry, and magnetometer. `ROBOCOREA_BOARD_ROLE_ARM` owns ODrive/ZE300/LKTech arm CAN. |
+| **Board role** | `ROBOCOREA_BOARD_ROLE_CHASSIS` owns RC, traction, flippers, and wheel-odom VESC telemetry. `ROBOCOREA_BOARD_ROLE_ARM` owns ODrive/ZE300/LKTech arm CAN. |
 | **Control scheme (fixed)** | No keybind table. Ch3=traction fwd, Ch4=turn, Ch2=flipper rate, Ch1=flipper L/R selector (min/center/max = left/both/right), Ch5=2-state pair select (min=front FL·FR, max=rear RL·RR), Ch6=3-position lever (down=E-STOP, center=normal, up=virtual-flip). Drive + flippers are always active together. See `config.h` "Channel roles". |
 | **Virtual flip (Ch6 up)** | "Drive from the other end" — a 180° remap of the control frame (negate forward, swap front/rear pair, mirror flipper L/R; turn is left as-is) so the symmetric robot can back out of a dead end without turning around. Signs are `VFLIP_*` macros in `config.h`. |
 | **Traction** | 2 VESCs, differential drive, `SET_RPM` velocity commands. |
 | **Flippers** | 4 VESCs. The **position loop runs on the VESC** (LispBM — see [`../VESC/flipper_position.lisp`](../VESC/flipper_position.lisp)). The ESP integrates the stick into a target angle, sends it through the fake-RPM carrier, and reports measured `[FL, FR, RL, RR]` angles from STATUS_5 tachometer feedback. Center stick = hold; no separate encoders. |
 | **Arm relay** | Arm-role firmware relays workstation joint commands (gamepad → IK) to CAN whenever armed & not e-stopped: ODrive J1–J3, ZE300 J4, LKTech J5–J6. |
 | **Arm operating mode** | Dexterity controls J1–J6. Chassis/transport keeps J1–J4 controlled and sends LKTech J5/J6 to motor-stop (torque-off). |
-| **Sensors** | LIS3MDL magnetometer over I2C. (No IMU on the ESP32 — orientation comes from the ZED2 camera on the Jetson; the thermal camera is on the Jetson; there is no gas sensor.) |
+| **Sensors** | No passive sensors live on the ESP32 in the normal robot build. The LIS3MDL magnetometer and MLX90640 thermal camera are on Jetson I2C; orientation comes from the ZED2; there is no gas sensor. |
 | **Protocol** | Binary UART at 921600 baud to the Jetson. Each board periodically sends `MSG_BOARD_IDENTITY`, then only publishes the telemetry owned by its role. |
 
 ---
@@ -31,7 +31,6 @@ For the whole-system picture see [`../../reference/architecture.md`](../../refer
 | Core | Task | Rate | Prio | Purpose |
 |------|------|------|------|---------|
 | 1 | `controlTask` | 50 Hz | 5 | Chassis: RC/base FSM. Arm: relay latest joint command while armed. |
-| 1 | `sensorTask`  | ~50 Hz | 2 | Chassis role only: LIS3MDL magnetometer sampling |
 | 0 | `commsTask`   | 50 Hz | 4 | UART RX parse + identity + role-owned telemetry TX |
 | 0 | `canTask`     | 200 Hz | 4 | Chassis: VESC CAN. Arm: ODrive/ZE300/LKTech CAN. |
 
@@ -72,10 +71,11 @@ recovery** and a cross-core SPI mutex for the MCP2515 path.
 - **ZE300** (J4) — arm role only; output-degree position; boot pose captured as zero.
 - **LKTech** (J5–J6) — arm role only; multi-loop angle control; boot pose captured as zero.
 
-VESC IDs (`60/50` traction, `20/10/40/30` flippers) and all gear ratios /
-direction signs live in `config.h` and **must be confirmed on the bench** (see
-the TODO list there and in the architecture doc). Enable VESC status frames 1/4/5
-in VESC Tool for traction/voltage/temperature telemetry.
+VESC IDs (`60/50` traction, `20/10/40/30` flippers), gear ratios
+(`TRACTION_GEAR_RATIO=23.333`, `FLIPPER_GEAR_RATIO=100`), and direction signs
+live in `config.h` and **must be confirmed on the bench** (see the TODO list
+there and in the architecture doc). Enable VESC status frames 1/4/5 in VESC
+Tool for traction/voltage/temperature telemetry.
 
 ---
 
@@ -130,23 +130,24 @@ and must stay in sync with the Jetson bridge `struct` formats.
 | Dir | Type | Name |
 |-----|------|------|
 | → PC | 0x01 | Telemetry (mode, flags, PPM[6], track speeds, flipper angle, uptime) |
-| → PC | 0x03 | Magnetometer |
+| → PC | 0x03 | *(reserved — magnetometer is published by Jetson `jetson_sensors`)* |
 | → PC | 0x05 | Status |
 | → PC | 0x07 | Flipper angles (FL,FR,RL,RR) |
 | → PC | 0x08 | VESC status (incl. tachometer → track odometry) |
 | → PC | 0x0A / 0x0B / 0x0C / 0x0D | ODrive / LKTech / ZE300 status, ODrive error |
 | → PC | 0x0E / 0x0F | Arm lifecycle / board identity |
 | ← PC | 0x10 | Arm joints (6 × int16 deg×100) |
-| ← PC | 0x11 | Sensor enable mask |
+| ← PC | 0x11 | *(reserved — `/sensors/enable_mask` is consumed on the Jetson)* |
 | ← PC | 0x12 / 0x13 | E-stop / clear |
 | ← PC | 0x19 | Arm operating mode: `0` dexterity, `1` chassis |
 | ← PC | 0x14 | *(reserved — was the keybind table; RC scheme is fixed now)* |
 | ← PC | 0x15 | PPM calibration |
 | ← PC | 0x16 | Gripper (→ PC originates; reserved) |
 
-(0x02 thermal, 0x04 gas, 0x06 IMU, 0x09 main-PWM are reserved-unused on this robot
-but the numbering is kept stable for GUI compatibility. Orientation now comes from
-the ZED2 camera on the Jetson, not the ESP32.)
+(0x02 thermal, 0x03 magnetometer, 0x04 gas, 0x06 IMU, 0x09 main-PWM are
+reserved-unused on this robot but the numbering is kept stable for GUI
+compatibility. Thermal and magnetometer are published by Jetson `jetson_sensors`;
+orientation comes from the ZED2 camera on the Jetson, not the ESP32.)
 
 The Jetson bridge routes outbound frames by role. Chassis ignores arm-only frames;
 arm ignores chassis-only frames; both accept software e-stop frames.
@@ -180,7 +181,6 @@ lib/      RC/             PPM decode (ISR) + calibration
           Locomotion/     drivetrain output (track mix + flipper angle/hold)
           CANInterface/   CAN HAL (MCP2515/TWAI) + VESC/ODrive/ZE300/LKTech
           Comms/          binary UART protocol
-          Sensors/        LIS3MDL magnetometer
           PID/            reusable PID (linear + shortest-angle) — spare
 src/      main.cpp        setup() + FreeRTOS tasks
 

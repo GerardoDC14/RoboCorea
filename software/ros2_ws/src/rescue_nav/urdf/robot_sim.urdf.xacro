@@ -1,0 +1,133 @@
+<?xml version="1.0"?>
+<!--
+  Gazebo Classic simulation model for the autonomy PoC.
+
+  Frames match dicerox_mapping's TF tree so the SAME SLAM + Nav2 stack runs in sim
+  and on hardware:
+
+      odom -> base_footprint -> base_laser
+
+  In sim there is no ZED, so planar_move stands in for the ZED odometry: it
+  consumes /cmd_vel (the SAME topic the hardware bridge feeds) and publishes the
+  odom -> base_footprint TF directly (on hardware, dicerox_mapping's
+  zed_planar_odom owns that transform). The 2D lidar publishes /scan in base_laser
+  exactly like the real Slamtec; dicerox_mapping's scan_frame_republisher then
+  produces /scan_flat for SLAM/Nav2.
+
+  Body dimensions / lidar mount are ROUGH (bench TODO: measure on the real robot).
+-->
+<robot name="robocorea_sim" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:property name="body_len"  value="0.50"/>
+  <xacro:property name="body_wid"  value="0.40"/>
+  <xacro:property name="body_hgt"  value="0.16"/>
+  <xacro:property name="body_mass" value="15.0"/>
+  <xacro:property name="laser_z"   value="${body_hgt + 0.04}"/>
+
+  <material name="rc_grey"><color rgba="0.30 0.30 0.32 1.0"/></material>
+  <material name="rc_accent"><color rgba="0.85 0.45 0.10 1.0"/></material>
+
+  <!-- base_footprint is the robot base frame (matches dicerox_mapping). It is a
+       massless root (KDL forbids inertia on the root link); the body box + inertia
+       live on base_link, which Gazebo lumps back onto the model via the fixed joint. -->
+  <link name="base_footprint"/>
+  <joint name="base_footprint_to_base_link" type="fixed">
+    <parent link="base_footprint"/>
+    <child  link="base_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 ${body_hgt/2.0}" rpy="0 0 0"/>
+      <geometry><box size="${body_len} ${body_wid} ${body_hgt}"/></geometry>
+      <material name="rc_grey"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${body_hgt/2.0}" rpy="0 0 0"/>
+      <geometry><box size="${body_len} ${body_wid} ${body_hgt}"/></geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 ${body_hgt/2.0}" rpy="0 0 0"/>
+      <mass value="${body_mass}"/>
+      <inertia
+        ixx="${body_mass/12.0*(body_wid*body_wid + body_hgt*body_hgt)}" ixy="0" ixz="0"
+        iyy="${body_mass/12.0*(body_len*body_len + body_hgt*body_hgt)}" iyz="0"
+        izz="${body_mass/12.0*(body_len*body_len + body_wid*body_wid)}"/>
+    </inertial>
+  </link>
+
+  <link name="base_laser">
+    <visual>
+      <geometry><cylinder radius="0.038" length="0.04"/></geometry>
+      <material name="rc_accent"/>
+    </visual>
+  </link>
+  <joint name="base_link_to_base_laser" type="fixed">
+    <parent link="base_link"/>
+    <child  link="base_laser"/>
+    <origin xyz="0.05 0.0 ${laser_z}" rpy="0 0 0"/>
+  </joint>
+
+  <gazebo reference="base_link"><material>Gazebo/Grey</material></gazebo>
+  <gazebo reference="base_laser"><material>Gazebo/Orange</material></gazebo>
+
+  <!-- Kinematic skid-steer drive + wheel odometry (ZED stand-in). -->
+  <gazebo>
+    <plugin name="planar_move" filename="libgazebo_ros_planar_move.so">
+      <ros>
+        <namespace>/</namespace>
+        <remapping>cmd_vel:=cmd_vel</remapping>
+        <remapping>odom:=odom</remapping>
+      </ros>
+      <update_rate>50</update_rate>
+      <publish_rate>50</publish_rate>
+      <odometry_frame>odom</odometry_frame>
+      <robot_base_frame>base_footprint</robot_base_frame>
+      <publish_odom>true</publish_odom>
+      <!-- In sim this IS the odom source (no ZED), so it owns odom->base_footprint. -->
+      <publish_odom_tf>true</publish_odom_tf>
+      <covariance_x>0.0004</covariance_x>
+      <covariance_y>0.0004</covariance_y>
+      <covariance_yaw>0.02</covariance_yaw>
+    </plugin>
+  </gazebo>
+
+  <!-- 2D lidar (Slamtec stand-in) -> /scan in base_laser. -->
+  <gazebo reference="base_laser">
+    <sensor name="lidar" type="ray">
+      <always_on>true</always_on>
+      <visualize>true</visualize>
+      <update_rate>10</update_rate>
+      <ray>
+        <scan>
+          <horizontal>
+            <samples>720</samples>
+            <resolution>1.0</resolution>
+            <min_angle>-3.14159</min_angle>
+            <max_angle>3.14159</max_angle>
+          </horizontal>
+        </scan>
+        <range>
+          <min>0.15</min>
+          <max>12.0</max>
+          <resolution>0.01</resolution>
+        </range>
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>0.01</stddev>
+        </noise>
+      </ray>
+      <plugin name="lidar_ros" filename="libgazebo_ros_ray_sensor.so">
+        <ros>
+          <namespace>/</namespace>
+          <remapping>~/out:=scan</remapping>
+        </ros>
+        <output_type>sensor_msgs/LaserScan</output_type>
+        <frame_name>base_laser</frame_name>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+</robot>
