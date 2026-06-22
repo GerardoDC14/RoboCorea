@@ -136,7 +136,11 @@
                                      // double-flips it (left/right swapped)
 #define VFLIP_SWAP_PAIR          1   // Ch5 front<->rear pair selection swaps
 #define VFLIP_SWAP_LEFTRIGHT     1   // flipper L/R selection mirrors (op-left = robot-right)
-#define VFLIP_INVERT_FLIP_RATE   0   // negate the flipper rate stick (default off)
+#define VFLIP_INVERT_FLIP_RATE   1   // negate the flipper rate stick: VFLIP_SWAP_PAIR +
+                                     // VFLIP_SWAP_LEFTRIGHT together flip which physical
+                                     // side (FL/RL dir=-1 vs FR/RR dir=+1) Ch1-left/right
+                                     // lands on, so the rate sign must flip too or the
+                                     // same stick input spins the flipper backwards
 
 // ─── Drivetrain: all six base motors are VESCs ───────────────────────────────
 // VESC CAN controller IDs — values from 1.ino/2.ino (the working board).
