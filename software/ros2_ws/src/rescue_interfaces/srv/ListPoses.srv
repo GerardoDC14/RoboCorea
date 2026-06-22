@@ -1,0 +1,4 @@
+# List every saved pose. names[i] corresponds to poses[i].
+---
+string[] names
+geometry_msgs/Pose[] poses

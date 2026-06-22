@@ -7,6 +7,7 @@
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QMessageBox>
 #include <QTextEdit>
 #include <QVBoxLayout>
 
@@ -253,6 +254,67 @@ DashboardPanel::DashboardPanel(rclcpp::Node::SharedPtr node, QWidget* parent)
     connect(estop_btn_, &QPushButton::toggled, this, &DashboardPanel::onEstopToggled);
     layout->addWidget(estop_btn_);
 
+    // ── Arm lifecycle (boots disarmed; arm/disarm + dexterity/chassis idle) ───
+    add_hsep();
+    {
+        auto* arm_hdr_row = new QHBoxLayout();
+        auto* arm_hdr = new QLabel("Arm", this);
+        arm_hdr->setStyleSheet(hdr_style);
+        arm_state_indicator_ = new QLabel("●", this);
+        arm_state_indicator_->setStyleSheet("color: #888; font-size: 14px;");
+        arm_state_label_ = new QLabel("—", this);
+        arm_state_label_->setStyleSheet("color: #888; font-size: 12px;");
+        arm_hdr_row->addWidget(arm_hdr);
+        arm_hdr_row->addStretch();
+        arm_hdr_row->addWidget(arm_state_indicator_);
+        arm_hdr_row->addWidget(arm_state_label_);
+        layout->addLayout(arm_hdr_row);
+    }
+    {
+        // Per-joint CAN presence (green once the joint's zero was captured at arm).
+        auto* can_row = new QHBoxLayout();
+        can_row->setSpacing(4);
+        auto* can_lbl = new QLabel("CAN", this);
+        can_lbl->setStyleSheet(lbl_style);
+        can_row->addWidget(can_lbl);
+        for (int j = 0; j < 6; ++j) {
+            arm_can_dots_[j] = new QLabel(QString("J%1").arg(j + 1), this);
+            arm_can_dots_[j]->setAlignment(Qt::AlignHCenter);
+            arm_can_dots_[j]->setStyleSheet("color: #666; font-size: 10px; font-weight: bold;");
+            can_row->addWidget(arm_can_dots_[j]);
+        }
+        can_row->addStretch();
+        layout->addLayout(can_row);
+    }
+    {
+        auto* arm_btn_row = new QHBoxLayout();
+        arm_btn_row->setSpacing(4);
+
+        arm_btn_ = new QPushButton("Arm", this);
+        arm_btn_->setMinimumHeight(28);
+        arm_btn_->setToolTip("Arm/init the manipulator (it boots disarmed for safety)");
+        arm_btn_->setStyleSheet(btn_style("#1a5a2a", "#2a7a3a", "#0a3a1a"));
+        connect(arm_btn_, &QPushButton::clicked, this, &DashboardPanel::onArmClicked);
+        arm_btn_row->addWidget(arm_btn_);
+
+        arm_disarm_btn_ = new QPushButton("Disarm", this);
+        arm_disarm_btn_->setMinimumHeight(28);
+        arm_disarm_btn_->setToolTip("Disarm (torque-off) the manipulator");
+        arm_disarm_btn_->setStyleSheet(btn_style("#5a2a2a", "#7a3a3a", "#3a1a1a"));
+        connect(arm_disarm_btn_, &QPushButton::clicked, this, &DashboardPanel::onDisarmClicked);
+        arm_btn_row->addWidget(arm_disarm_btn_);
+
+        arm_mode_btn_ = new QPushButton("Mode: Dexterity", this);
+        arm_mode_btn_->setMinimumHeight(28);
+        arm_mode_btn_->setToolTip("Toggle Dexterity ⇄ Chassis. Chassis idles the wrist "
+                                  "(J5/J6 torque-off) — use it when the arm is parked.");
+        arm_mode_btn_->setStyleSheet(btn_style("#2a4a7f", "#3a5a9f", "#1a3a6f"));
+        connect(arm_mode_btn_, &QPushButton::clicked, this, &DashboardPanel::onArmModeToggle);
+        arm_btn_row->addWidget(arm_mode_btn_);
+
+        layout->addLayout(arm_btn_row);
+    }
+
     auto* btn_row = new QHBoxLayout();
     btn_row->setSpacing(4);
 
@@ -296,6 +358,34 @@ DashboardPanel::DashboardPanel(rclcpp::Node::SharedPtr node, QWidget* parent)
     estop_timer_ = new QTimer(this);
     connect(estop_timer_, &QTimer::timeout, this, &DashboardPanel::publishEstopState);
     estop_timer_->start(100);
+
+    // ── Arm lifecycle (ROS thread → Qt via queued signals) ───────────────────
+    connect(this, &DashboardPanel::armStateUpdated,
+            this, &DashboardPanel::onArmStateUpdated, Qt::QueuedConnection);
+    connect(this, &DashboardPanel::armModeUpdated,
+            this, &DashboardPanel::onArmModeUpdated, Qt::QueuedConnection);
+    connect(this, &DashboardPanel::armPresenceUpdated,
+            this, &DashboardPanel::onArmPresenceUpdated, Qt::QueuedConnection);
+
+    // Latched to match the bridge so a late-joining GUI sees the current state.
+    auto arm_qos = rclcpp::QoS(1).reliable().transient_local();
+    arm_state_sub_ = node_->create_subscription<std_msgs::msg::String>(
+        "/arm/state", arm_qos, [this](std_msgs::msg::String::SharedPtr msg) {
+            emit armStateUpdated(QString::fromStdString(msg->data));
+        });
+    arm_mode_sub_ = node_->create_subscription<std_msgs::msg::String>(
+        "/arm/operating_mode", arm_qos, [this](std_msgs::msg::String::SharedPtr msg) {
+            emit armModeUpdated(QString::fromStdString(msg->data));
+        });
+    arm_presence_sub_ = node_->create_subscription<std_msgs::msg::UInt16>(
+        "/arm/can_presence", arm_qos, [this](std_msgs::msg::UInt16::SharedPtr msg) {
+            emit armPresenceUpdated(static_cast<int>(msg->data));
+        });
+
+    arm_cli_           = node_->create_client<std_srvs::srv::Trigger>("/arm/arm");
+    arm_disarm_cli_    = node_->create_client<std_srvs::srv::Trigger>("/arm/disarm");
+    arm_dexterity_cli_ = node_->create_client<std_srvs::srv::Trigger>("/arm/mode/dexterity");
+    arm_chassis_cli_   = node_->create_client<std_srvs::srv::Trigger>("/arm/mode/chassis");
 }
 
 void DashboardPanel::setConnState(const QString& color, const QString& label)
@@ -409,4 +499,95 @@ void DashboardPanel::publishEstopState()
     std_msgs::msg::Bool msg;
     msg.data = estop_active_.load();
     estop_pub_->publish(msg);
+}
+
+void DashboardPanel::applySpeechAudioSettings()
+{
+    auto& S = AppSettings::instance();
+    if (speech_processor_) {
+        std::lock_guard<std::mutex> lk(S.strings_mutex);
+        speech_processor_->setGrammar(S.vosk_grammar);
+    }
+    // setChecked emits toggled() (→ audioMonitorToggled) only on a real change.
+    if (audio_btn_)
+        audio_btn_->setChecked(S.audio_start_enabled.load());
+}
+
+// ── Arm lifecycle ─────────────────────────────────────────────────────────────
+
+void DashboardPanel::callArmTrigger(
+    const rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr& cli, const char* what)
+{
+    if (!cli->service_is_ready()) {
+        RCLCPP_WARN(node_->get_logger(),
+                    "Arm '%s' requested but the service is not available "
+                    "(is the esp32_bridge running?)", what);
+        return;
+    }
+    cli->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+    RCLCPP_INFO(node_->get_logger(), "Arm: '%s' requested", what);
+}
+
+void DashboardPanel::onArmClicked()    { callArmTrigger(arm_cli_, "arm"); }
+void DashboardPanel::onDisarmClicked() { callArmTrigger(arm_disarm_cli_, "disarm"); }
+
+void DashboardPanel::onArmModeToggle()
+{
+    // Chassis idles the wrist (J5/J6 torque-off); Dexterity restores full 6-DOF.
+    if (arm_mode_ == "CHASSIS")
+        callArmTrigger(arm_dexterity_cli_, "dexterity mode");
+    else
+        callArmTrigger(arm_chassis_cli_, "chassis mode");
+}
+
+void DashboardPanel::onArmStateUpdated(const QString& state)
+{
+    arm_state_ = state;
+    arm_state_label_->setText(state);
+
+    QString color = "#888";
+    if (state == "READY")             color = "#33cc33";
+    else if (state == "INITIALIZING") color = "#ccaa00";
+    else if (state == "FAULT")        color = "#cc3333";
+    arm_state_indicator_->setStyleSheet(QString("color: %1; font-size: 14px;").arg(color));
+    arm_state_label_->setStyleSheet(QString("color: %1; font-size: 12px;").arg(color));
+
+    const bool ready = (state == "READY");
+    arm_btn_->setEnabled(!ready);                          // can't re-arm when ready
+    arm_disarm_btn_->setEnabled(ready || state == "INITIALIZING");
+    arm_mode_btn_->setEnabled(ready);                      // mode only meaningful when ready
+
+    // One-shot startup prompt: the arm boots passive by design, so offer to arm
+    // it the first time we learn it's connected but disarmed.
+    if (!auto_arm_prompted_) {
+        auto_arm_prompted_ = true;
+        if (state == "UNINIT") {
+            auto reply = QMessageBox::question(
+                this, "Arm the manipulator?",
+                "The arm is connected but disarmed (it boots passive for safety).\n\n"
+                "Arm it now? It will then accept joint commands.",
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+            if (reply == QMessageBox::Yes)
+                callArmTrigger(arm_cli_, "arm");
+        }
+    }
+}
+
+void DashboardPanel::onArmModeUpdated(const QString& mode)
+{
+    arm_mode_ = mode;
+    arm_mode_btn_->setText(mode == "CHASSIS" ? "Mode: Chassis (wrist idle)"
+                                             : "Mode: Dexterity");
+}
+
+void DashboardPanel::onArmPresenceUpdated(int mask)
+{
+    // Bits 0..5 = J1..J6 (ODrive J1-3, ZE300 J4, LKTech J5-6). Set when each
+    // joint's zero is captured at arm time; 0 before arming.
+    for (int j = 0; j < 6; ++j) {
+        const bool present = (mask >> j) & 0x1;
+        arm_can_dots_[j]->setStyleSheet(
+            QString("color: %1; font-size: 10px; font-weight: bold;")
+                .arg(present ? "#33cc33" : "#cc3333"));
+    }
 }

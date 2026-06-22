@@ -2,18 +2,51 @@
 //
 // RoboCorea — ESP32 firmware configuration
 // =========================================
-// Single robot. Every actuator hangs off ONE 500 kbps CAN 2.0 bus through the
-// on-board SMD MCP2515 (TWAI + SN65HVD230 kept compilable for a future board):
-//   • 6 VESC mini 6.7 Pro  — 2 traction (velocity) + 4 flippers (position loop
-//                            runs ON the VESC in LispBM; the ESP owns the target)
-//   • 3 ODrive (CANSimple)  — arm J1–J3
-//   • 1 ZE300              — arm J4
-//   • 2 LKTech/MyActuator  — arm J5–J6
+// Two identical PCBs run this same firmware. The only intended per-board
+// difference is ROBOCOREA_BOARD_ROLE below:
+//   • CHASSIS owns RC/PPM, traction VESCs, flipper VESCs, wheel-odom VESC
+//     telemetry, and the LIS3MDL magnetometer.
+//   • ARM owns the mixed-CAN arm bus: ODrive J1–J3, ZE300 J4, LKTech J5–J6.
 //
 // Pin numbers below were inherited from the legacy Dicerox bring-up and MUST be
 // reconciled against the actual RoboCorea PCB before flashing.
 //
 // See reference/architecture.md for the full system picture.
+
+// ─── Board role / identity ───────────────────────────────────────────────────
+// Leave the committed default as CHASSIS. For the arm PCB, change only this macro
+// to ROBOCOREA_BOARD_ROLE_ARM before building/flashing.
+#define ROBOCOREA_BOARD_ROLE_CHASSIS  1
+#define ROBOCOREA_BOARD_ROLE_ARM      2
+#ifndef ROBOCOREA_BOARD_ROLE
+  #define ROBOCOREA_BOARD_ROLE ROBOCOREA_BOARD_ROLE_CHASSIS
+#endif
+
+#if ROBOCOREA_BOARD_ROLE == ROBOCOREA_BOARD_ROLE_CHASSIS
+  #define ROBOCOREA_ROLE_IS_CHASSIS 1
+  #define ROBOCOREA_ROLE_IS_ARM     0
+#elif ROBOCOREA_BOARD_ROLE == ROBOCOREA_BOARD_ROLE_ARM
+  #define ROBOCOREA_ROLE_IS_CHASSIS 0
+  #define ROBOCOREA_ROLE_IS_ARM     1
+#else
+  #error "ROBOCOREA_BOARD_ROLE must be ROBOCOREA_BOARD_ROLE_CHASSIS or ROBOCOREA_BOARD_ROLE_ARM"
+#endif
+
+#define ROBOCOREA_PROTOCOL_VERSION       1
+#define BOARD_CAP_CHASSIS_IO       (1 << 0)
+#define BOARD_CAP_ARM_IO           (1 << 1)
+#define BOARD_CAP_RC_PPM           (1 << 2)
+#define BOARD_CAP_MAG              (1 << 3)
+#define BOARD_CAP_VESC_BASE        (1 << 4)
+#define BOARD_CAP_ARM_CAN          (1 << 5)
+
+#if ROBOCOREA_ROLE_IS_CHASSIS
+  #define ROBOCOREA_BOARD_CAPABILITIES \
+    (BOARD_CAP_CHASSIS_IO | BOARD_CAP_RC_PPM | BOARD_CAP_MAG | BOARD_CAP_VESC_BASE)
+#else
+  #define ROBOCOREA_BOARD_CAPABILITIES \
+    (BOARD_CAP_ARM_IO | BOARD_CAP_ARM_CAN)
+#endif
 
 // ─── I2C (LIS3MDL magnetometer) ──────────────────────────────────────────────
 // Pins per 1.ino/2.ino (the working board). The on-board magnetometer is a
@@ -73,9 +106,39 @@
 #define PPM_MAX_US         2000      // nominal max pulse
 #define PPM_TIMEOUT_MS      500      // failsafe: no valid frame within this → neutral
 
-// Channel roles (1-indexed to match the physical FlySky labels)
-#define PPM_CH_MODE           5      // Ch5 — 3-position lever selects the keybind row
-#define PPM_CH_ESTOP          6      // Ch6 — dedicated hardware e-stop
+// Channel roles (1-indexed to match the physical FlySky labels). FIXED control
+// scheme (no GUI keybind table): Ch1-4 are joysticks, Ch5/Ch6 are levers.
+//   Ch1  flipper L/R selector  (min=left only, center=both, max=right only)
+//   Ch2  flipper rate          (drives whichever flipper(s) Ch1+Ch5 select)
+//   Ch3  traction forward/back
+//   Ch4  traction turn
+//   Ch5  2-state pair select   (min=FRONT pair FL/FR, max=REAR pair RL/RR)
+//   Ch6  3-position lever      (down=E-STOP, center=normal, up=virtual-flip)
+// Drive + flippers are always active together; the arm is driven from the
+// workstation (MSG_ARM_JOINTS), not the RC.
+#define PPM_CH_FLIP_SELECT    1
+#define PPM_CH_FLIP_RATE      2
+#define PPM_CH_TRACTION_FWD   3
+#define PPM_CH_TRACTION_TURN  4
+#define PPM_CH_FLIP_PAIR      5
+#define PPM_CH_MODE2          6      // 3-position: e-stop / normal / virtual-flip
+
+// Lever decision thresholds on the calibrated normalised value (RC::normalise →
+// [-1,1]). Ch5 (2-state) splits at 0; Ch6 (3-state) uses the outer thirds.
+#define LEVER_HI_THRESH       0.5f    // Ch6 up  → virtual-flip
+#define LEVER_LO_THRESH     (-0.5f)   // Ch6 down → E-STOP
+
+// Virtual-flip ("drive from the other end") sign conventions. With Ch6 up the
+// symmetric robot is driven as if its rear were the front, so it can back out of
+// a dead-end hallway without turning around. Each part is a bench-tunable sign —
+// set to 0 to disable that piece of the 180° remap.
+#define VFLIP_INVERT_FORWARD     1   // negate traction forward
+#define VFLIP_INVERT_TURN        0   // keep turn as-is: negating forward already
+                                     // mirrors steering, so inverting turn too
+                                     // double-flips it (left/right swapped)
+#define VFLIP_SWAP_PAIR          1   // Ch5 front<->rear pair selection swaps
+#define VFLIP_SWAP_LEFTRIGHT     1   // flipper L/R selection mirrors (op-left = robot-right)
+#define VFLIP_INVERT_FLIP_RATE   0   // negate the flipper rate stick (default off)
 
 // ─── Drivetrain: all six base motors are VESCs ───────────────────────────────
 // VESC CAN controller IDs — values from 1.ino/2.ino (the working board).
@@ -90,9 +153,14 @@
 // Direction correction per motor (+1 normal, -1 reversed wiring) — verify on bench.
 #define TRACTION_DIR_LEFT     (1.0f)
 #define TRACTION_DIR_RIGHT    (1.0f)
-#define FLIPPER_DIR_FL        (1.0f)
+// Flippers: the left and right motors are mirror-mounted, so a single "raise"
+// stick must drive the two sides in opposite directions. This matches the proven
+// 5.ino, which integrates the left flippers (FL/RL) with a negative sign and the
+// right flippers (FR/RR) with a positive sign. Re-confirm against the wiring on
+// the bench (flip a sign here if a corner moves the wrong way).
+#define FLIPPER_DIR_FL        (-1.0f)
 #define FLIPPER_DIR_FR        (1.0f)
-#define FLIPPER_DIR_RL        (1.0f)
+#define FLIPPER_DIR_RL        (-1.0f)
 #define FLIPPER_DIR_RR        (1.0f)
 
 // Mechanical reduction (motor → output shaft). Same gearbox on all six motors.
@@ -103,13 +171,54 @@
 #define VESC_POLE_PAIRS          7      // TODO: confirm motor pole-pair count
 
 // Traction: full-stick output speed (eRPM sent to the traction VESCs).
-#define TRACTION_ERPM_MAX     8000      // TODO: tune for the actual motors
+#define TRACTION_ERPM_MAX     14000      // TODO: tune for the actual motors
 
 // ── Flippers: position loop runs ON the VESC (firmware/VESC/flipper_position.lisp)
-// The ESP32 integrates the stick into a wrapped target angle and sends it to the
-// flipper VESC over a custom CAN frame; the VESC closes the loop and reports its
-// measured angle back. The PD/feedforward gains and the angle scale live in the
-// LISP, not here — see that file.
+// The ESP32 integrates the stick into a target angle and sends it to the flipper
+// VESC. The most reliable transport on this robot has been the legacy fake-RPM
+// contract: SET_RPM carries target_degrees × 1000 and the VESC Lisp reads it
+// with get-rpm-set. Keep this enabled unless the custom 0x7E/0x7F Lisp CAN path
+// is proven on the actual VESC firmware build.
+#define FLIPPER_USE_LEGACY_RPM_LISP  1
+
+// Telemetry source for the flipper angle reported on /encoders/flipper.
+//
+// This selects ONLY where the *reported* angle comes from — it no longer touches
+// the control loop. The flipper target is a free-running accumulator (Control.cpp)
+// that the lisp tracks; the ESP never feeds a measured angle back into the target.
+// (That feedback path, with the sign-inverted tach below, is what used to make the
+// flippers run away to a ~180° attractor — that coupling is now gone, so enabling
+// this is safe.)
+//
+//   1 = report the STATUS_5 tachometer angle. Shows real motion the command does
+//       not capture: moving a flipper by hand, or a stall/under-load error the
+//       VESC loop can't fully correct. Requires STATUS_5 enabled on the flipper
+//       VESCs in VESC Tool, and the FLIPPER_TACH_* scale/sign/zero below
+//       calibrated. The angle is INCREMENTAL from the first STATUS_5 frame after
+//       boot (boot pose ≈ 0 + FLIPPER_TACH_ZERO_DEG_*), not absolute.
+//   0 = report the commanded target instead (no measurement; the lisp tracks it,
+//       so it equals the real angle only while the loop is actually holding).
+#define FLIPPER_USE_TACH_FEEDBACK    1
+
+// Tachometer conversion. Bench calibration: the old scale reported 535 deg for
+// a measured 90 deg motion, and its sign was inverted (downward was positive).
+// Keep the negative scale so downward motion maps to 270 deg after positive
+// modulo 360.
+#define FLIPPER_TACH_SCALE_CAL   (90.0f / 535.0f)
+#define FLIPPER_TACH_BASE_DEG_PER_COUNT  (360.0f / (VESC_POLE_PAIRS * DRIVE_GEAR_RATIO))
+#define FLIPPER_TACH_DEG_PER_COUNT_FL  (-FLIPPER_TACH_BASE_DEG_PER_COUNT * FLIPPER_TACH_SCALE_CAL)
+#define FLIPPER_TACH_DEG_PER_COUNT_FR  (-FLIPPER_TACH_BASE_DEG_PER_COUNT * FLIPPER_TACH_SCALE_CAL)
+#define FLIPPER_TACH_DEG_PER_COUNT_RL  (-FLIPPER_TACH_BASE_DEG_PER_COUNT * FLIPPER_TACH_SCALE_CAL)
+#define FLIPPER_TACH_DEG_PER_COUNT_RR  (-FLIPPER_TACH_BASE_DEG_PER_COUNT * FLIPPER_TACH_SCALE_CAL)
+
+#define FLIPPER_TACH_ZERO_DEG_FL   0.0f
+#define FLIPPER_TACH_ZERO_DEG_FR   0.0f
+#define FLIPPER_TACH_ZERO_DEG_RL   0.0f
+#define FLIPPER_TACH_ZERO_DEG_RR   0.0f
+
+// If fake-RPM mode is disabled, normal mode uses custom CAN frames: the VESC
+// closes the loop and reports its measured angle back. The PD/feedforward gains
+// and angle scale live in the Lisp, not here.
 //
 // Custom CAN command bytes carried in the VESC extended-ID cmd field
 // (id = (cmd<<8)|vesc_id). 0x7E/0x7F are outside the VESC 6.06 CAN_PACKET set, so
@@ -128,53 +237,38 @@
 #define FLIPPER_ANGLE_MIN       0.0f
 #define FLIPPER_ANGLE_MAX     360.0f
 
-// On hard e-stop: 1 = hold position (VESC keeps the loop closed), 0 = coast
-// (ESP sends enable=0 → lisp set-current 0). RC-loss always HOLDS (never homes).
-#define FLIPPER_ESTOP_HOLD        0
+// ── Flipper anti-collision (dynamic joint limits, front vs rear, per side) ────
+// The front and rear flipper on a side collide when both point toward the middle
+// of the robot — the front leaning back toward ~180° and the rear leaning forward
+// toward ~0°. Forbid that joint state: a flipper may not enter its danger arc
+// while its same-side partner is already in its own danger arc; otherwise both
+// spin freely. Left (FL/RL) and right (FR/RR) are checked independently.
+//
+// Each arc is CENTER ± HALFWIDTH degrees on the wrapped [0,360) angle:
+//   FRONT 180 ± 60 → forbidden when front ∈ [120,240]   (the arc through 180°)
+//   REAR    0 ± 60 → forbidden when rear  ∈ [300,60]     (the arc through 0°)
+// (For an arc [a,b], set CENTER=(a+b)/2 and HALFWIDTH=(b−a)/2.)
+//
+// This limits the COMMANDED targets, so the firmware never drives the two
+// flippers into each other. It does not react to a flipper shoved into its arc
+// by pure external load (that motion is not commanded).
+#define FLIPPER_COLLISION_ENABLE               1
+#define FLIPPER_COLLISION_FRONT_CENTER_DEG     180.0f
+#define FLIPPER_COLLISION_FRONT_HALFWIDTH_DEG   80.0f
+#define FLIPPER_COLLISION_REAR_CENTER_DEG        0.0f
+#define FLIPPER_COLLISION_REAR_HALFWIDTH_DEG    80.0f
 
-// ── Flipper collision avoidance (dynamic joint limits) ──────────────────────
-// The front and rear flipper on the SAME side share a side-view plane and can
-// collide when they lean toward each other (rear up-forward + front up-back
-// meeting over the chassis, and the mirror image below). Geometry, per side:
-//   • both pivots lie on the chassis FLIPPER_PIVOT_SPACING_M apart (same height);
-//   • each flipper is a FLIPPER_LENGTH_M segment from its pivot to the tip;
-//   • 0° = pointing straight forward (+x), angle increases toward "up".
-// A collision zone exists only when 2·length > spacing > length (long enough to
-// reach each other, but pivots not so close they always overlap). The ESP clamps
-// each flipper's integrated TARGET so its segment never closes to within
-// FLIPPER_COLLISION_MARGIN_M of the paired flipper's MEASURED segment; a step
-// that would close the gap below the margin is refused (the flipper holds at the
-// boundary and frees the instant the stick reverses or the other flipper backs
-// off). The VESC still owns the actual position loop. Math + the 2y>x>y guard
-// live in lib/Control/FlipperCollision.h.
-#define FLIPPER_COLLISION_AVOID_ENABLE  1
-
-// Side-view geometry. PLACEHOLDERS — measure on the real chassis. Must satisfy
-// 2·FLIPPER_LENGTH_M > FLIPPER_PIVOT_SPACING_M > FLIPPER_LENGTH_M (a static_assert
-// in FlipperCollision.h enforces this whenever the feature is enabled).
-#define FLIPPER_PIVOT_SPACING_M   0.52f   // x: front↔rear pivot center distance (TODO measure)
-#define FLIPPER_LENGTH_M          0.38f   // y: pivot to tip (TODO measure)
-
-// Clearance kept between the two flipper centerlines: this flipper's half-width
-// + the other's half-width + a safety buffer. The buffer MUST exceed the tip
-// travel of both flippers in one control tick
-//   2 · FLIPPER_LENGTH_M · FLIPPER_RATE_DPS · (π/180) / CONTROL_LOOP_HZ
-// so a single step can never jump from "clear" to "touching". TODO: set from the
-// real flipper width plus a few mm of safety.
-#define FLIPPER_COLLISION_MARGIN_M  0.1f
-
-// Per-flipper mapping from the VESC-reported angle to the shared geometric frame
-// (0° = forward, + = up/CCW):  geo = SIGN · (reported_deg − OFFSET_DEG). Use
-// these if a flipper's zero isn't "forward" or it rotates the opposite way (e.g.
-// a mirrored mount). Default: identity (reported angle is already in-frame).
-#define FLIPPER_GEO_OFFSET_FL   0.0f
-#define FLIPPER_GEO_OFFSET_FR   0.0f
-#define FLIPPER_GEO_OFFSET_RL   0.0f
-#define FLIPPER_GEO_OFFSET_RR   0.0f
-#define FLIPPER_GEO_SIGN_FL   (1.0f)
-#define FLIPPER_GEO_SIGN_FR   (1.0f)
-#define FLIPPER_GEO_SIGN_RL   (1.0f)
-#define FLIPPER_GEO_SIGN_RR   (1.0f)
+// On e-stop (hardware OR software): 1 = HOLD the flippers where they are (the
+// VESC keeps the position loop closed at the last commanded target, exactly like
+// the RC-loss failsafe in Locomotion::neutralise()), 0 = "coast".
+//
+// IMPORTANT — keep this 1 in fake-RPM mode (FLIPPER_USE_LEGACY_RPM_LISP). That
+// lisp path has no enable/coast bit, so enable=0 does NOT free-wheel: it maps to
+// target 0 (CANInterface::sendFlipperAngles → command_deg = 0), which drives
+// EVERY flipper to its zero angle on e-stop — they appear to jump to "random"
+// positions. Holding (=1) freezes them in place with no jump. Only the
+// custom-frame (non-fake-RPM) path actually coasts when this is 0.
+#define FLIPPER_ESTOP_HOLD        1
 
 // ─── Arm: ODrive (J1–J3) ─────────────────────────────────────────────────────
 // CANSimple, COB-ID = (node_id << 5) | cmd_id. Node IDs from the legacy bridge.
@@ -261,12 +355,21 @@
 //   0 UNINIT (passive/disarmed) · 1 INITIALIZING · 2 READY · 3 FAULT
 #define ARM_PASSIVE_BOOT          1    // 1 = boot disarmed (safe); 0 = legacy auto-arm at boot
 
+// On e-stop (RC Ch6-down, software, or mirrored chassis stop): 1 = HOLD the arm
+// at its last commanded pose with the motors still energized, so the (heavy,
+// non-backdrivable-enough) arm freezes in place instead of going limp and
+// falling under gravity. 0 = legacy behaviour: de-energize every joint (ODrive
+// IDLE / LKTech off / ZE300 disable → arm droops) and drop to UNINIT (a fresh
+// /arm/arm is then required). Mirrors FLIPPER_ESTOP_HOLD. Disarm and latched
+// faults still de-energize regardless of this flag — only e-stop holds.
+#define ARM_ESTOP_HOLD            1
+
 // Bench-only arm test mode. Set to 1 only when the PCB has no RC receiver/PPM
 // input during an arm-only desk test: the control task stays in ARM mode even
 // without RC, neutralizes base outputs, and accepts MSG_ARM_JOINTS from the
 // laptop. The arm lifecycle gate still applies, so you must call /arm/arm before
 // motion. Keep this 0 for the robot.
-#define ARM_BENCH_MODE_NO_PPM     1
+#define ARM_BENCH_MODE_NO_PPM     0
 
 // Latched fault: count failures inside a sliding window; exceed → FAULT + disarm.
 #define ARM_FAULT_WINDOW_MS    1000
@@ -324,13 +427,16 @@
 #define MSG_ZE300_STATUS     0x0C      // arm J4 telemetry
 #define MSG_ODRIVE_ERROR     0x0D      // arm ODrive error snapshot (optional)
 #define MSG_ARM_LIFECYCLE    0x0E      // arm safety state + fault + diagnostics
+#define MSG_BOARD_IDENTITY   0x0F      // role + protocol version + capability bits
 
 // PC → ESP32
 #define MSG_ARM_JOINTS       0x10      // 6 × int16 joint angles (deg × 100)
 #define MSG_SENSOR_ENABLE    0x11      // 1-byte bitmask
 #define MSG_ESTOP            0x12      // 0-byte payload — immediate stop
 #define MSG_ESTOP_CLEAR      0x13      // 0-byte payload — resume
-#define MSG_KEYBIND          0x14      // 15 bytes: 3 modes × 5 channel slots
+#define MSG_KEYBIND          0x14      // RESERVED — the per-channel keybind table was
+                                       // replaced by the fixed RC control scheme
+                                       // (firmware Control.cpp); id kept reserved.
 #define MSG_PPM_CALIB        0x15      // 6ch × (min,neutral,max) u16 + deadband
 #define MSG_GRIPPER          0x16      // int16 normalised × 1000
 #define MSG_ARM_INIT         0x17      // 0-byte — explicit arm/init (passive boot)

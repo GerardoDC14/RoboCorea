@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>arm_description</name>
+  <version>0.1.0</version>
+  <description>
+    Full RoboCorea robot description: the 6-DOF arm bolted onto the tracked
+    chassis with its four articulated flippers, merged into one URDF for the
+    digital twin (robot_state_publisher -> /robot_description) and for the arm's
+    body-collision avoidance. The chassis + flipper meshes live here; the arm
+    link meshes stay in arm_teleop and are referenced by package:// URI.
+  </description>
+  <maintainer email="nabetse069@gmail.com">RoboCorea</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>joint_state_publisher</exec_depend>
+  <exec_depend>joint_state_publisher_gui</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <!-- The combined URDF references the arm link meshes (Link1..Link6) via
+       package://arm_teleop. That URI is resolved at runtime by ament_index, so
+       no build/exec dependency on arm_teleop is declared here — arm_teleop is
+       the consumer of this package (it depends on arm_description), which would
+       otherwise create a dependency cycle. -->
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

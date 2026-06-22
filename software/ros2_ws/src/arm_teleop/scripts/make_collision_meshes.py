@@ -2,12 +2,13 @@
 """
 Generate low-poly collision proxies for the arm links.
 
-The CAD-exported collision STLs in ``meshes/collision/`` are full-resolution
+The CAD-exported collision STLs in ``meshes/collision_src/`` are full-resolution
 (Link6 alone is ~118k triangles). That is fine for rendering but far too heavy
 for a 100 Hz self-collision check: FCL distance queries scale with mesh size.
 This script decimates each link to a few hundred / thousand triangles with
 quadric edge-collapse (shape-preserving, keeps concavity — unlike a convex
-hull), writing the result to ``meshes/collision_lowpoly/``.
+hull), writing the lowercase ``.stl`` proxies the runtime loads to
+``meshes/collision/``.
 
 The decimated proxy may sit a millimetre or two *inside* the true surface; that
 is compensated at runtime by ``collision_stop_dist`` (the safety margin in
@@ -30,8 +31,11 @@ import trimesh
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.dirname(HERE)
-SRC_DIR = os.path.join(PKG, 'meshes', 'collision')
-OUT_DIR = os.path.join(PKG, 'meshes', 'collision_lowpoly')
+# Full-res CAD STLs go in collision_src/; the decimated proxies the runtime
+# actually loads are written to collision/ (point --src elsewhere if your CAD
+# export lives outside the package).
+SRC_DIR = os.path.join(PKG, 'meshes', 'collision_src')
+OUT_DIR = os.path.join(PKG, 'meshes', 'collision')
 
 
 def main() -> int:
@@ -61,7 +65,8 @@ def main() -> int:
         mesh.update_faces(mesh.nondegenerate_faces())
         after = len(mesh.faces)
 
-        out_path = os.path.join(args.out, name)
+        # Runtime loads lowercase .stl proxies regardless of the source case.
+        out_path = os.path.join(args.out, os.path.splitext(name)[0] + '.stl')
         mesh.export(out_path)
         total_before += before
         total_after += after

@@ -171,6 +171,7 @@ static uint8_t canBackendEflg() {
 
 // ─── State + small helpers ────────────────────────────────────────────────────
 static bool s_ok = false;
+static uint16_t s_arm_presence_mask = 0;
 
 static inline float clampf(float v, float lo, float hi) {
     return (v < lo) ? lo : (v > hi) ? hi : v;
@@ -221,13 +222,35 @@ static inline uint16_t getUint16LE(const uint8_t* d) {
     return (uint16_t)d[0] | ((uint16_t)d[1] << 8);
 }
 
+static void noteArmPresenceFromRxFrame(const CanFrame& f) {
+    if (f.extd || f.rtr) return;
+
+    const uint32_t id = f.id;
+    const uint8_t odrv_node = (uint8_t)((id >> 5) & 0x3F);
+    if (odrv_node == ODRIVE_NODE_J1) s_arm_presence_mask |= (uint16_t)(1U << 0);
+    if (odrv_node == ODRIVE_NODE_J2) s_arm_presence_mask |= (uint16_t)(1U << 1);
+    if (odrv_node == ODRIVE_NODE_J3) s_arm_presence_mask |= (uint16_t)(1U << 2);
+
+    if (id == (uint32_t)ZE300_ID_J4)
+        s_arm_presence_mask |= (uint16_t)(1U << 3);
+    if (id == (uint32_t)(LKTECH_ID_BASE + LKTECH_ID_J5))
+        s_arm_presence_mask |= (uint16_t)(1U << 4);
+    if (id == (uint32_t)(LKTECH_ID_BASE + LKTECH_ID_J6))
+        s_arm_presence_mask |= (uint16_t)(1U << 5);
+}
+
 // Blocking receive of one frame matching a predicate, until timeout_ms.
 template <typename Pred>
 static bool canReceiveUntil(uint32_t timeout_ms, CanFrame& out, Pred match) {
     uint32_t deadline = millis() + timeout_ms;
     while (millis() < deadline) {
         CanFrame f;
-        if (canReceive(f) && match(f)) { out = f; return true; }
+        if (canReceive(f)) {
+            noteArmPresenceFromRxFrame(f);
+            if (match(f)) { out = f; return true; }
+        } else {
+            delay(1);
+        }
     }
     return false;
 }
@@ -276,9 +299,23 @@ static const uint8_t s_traction_id[2] = { VESC_ID_TRACTION_LEFT, VESC_ID_TRACTIO
 static const float   s_traction_dir[2]= { TRACTION_DIR_LEFT, TRACTION_DIR_RIGHT };
 static const uint8_t s_flipper_id[4]  = { VESC_ID_FLIPPER_FL, VESC_ID_FLIPPER_FR,
                                           VESC_ID_FLIPPER_RL, VESC_ID_FLIPPER_RR };
-// Flipper angle reported by the VESC lisp (deg, wrapped). Index = FL,FR,RL,RR.
+// Flipper angle used by telemetry (deg). Index = FL,FR,RL,RR.
+// Usually derived from STATUS_5 tachometer; custom Lisp report is still parsed
+// when that experimental path is enabled.
 static float s_flipper_deg[4]  = { 0, 0, 0, 0 };
 static bool  s_flipper_deg_ok[4] = { false, false, false, false };
+#if FLIPPER_USE_TACH_FEEDBACK
+static const float s_flipper_tach_deg_per_count[4] = {
+    FLIPPER_TACH_DEG_PER_COUNT_FL, FLIPPER_TACH_DEG_PER_COUNT_FR,
+    FLIPPER_TACH_DEG_PER_COUNT_RL, FLIPPER_TACH_DEG_PER_COUNT_RR
+};
+static const float s_flipper_tach_zero_deg[4] = {
+    FLIPPER_TACH_ZERO_DEG_FL, FLIPPER_TACH_ZERO_DEG_FR,
+    FLIPPER_TACH_ZERO_DEG_RL, FLIPPER_TACH_ZERO_DEG_RR
+};
+static int32_t s_flipper_tach_zero_count[4] = { 0, 0, 0, 0 };
+static bool    s_flipper_tach_zero_ok[4] = { false, false, false, false };
+#endif
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  ODrive arm (standard frames, COB-ID = (node_id << 5) | cmd_id)
@@ -321,6 +358,15 @@ static bool odrvReadEncoderZero(uint8_t node, float& out_turns) {
         })) {
         out_turns = getFloat32LE(rx.data);
         return true;
+    }
+    return false;
+}
+static bool odrvInitAndReadZero(uint8_t node, float& zero) {
+    for (uint8_t a = 0; a < ODRIVE_INIT_MAX_RETRIES; a++) {
+        if (a > 0) delay(ODRIVE_INIT_RETRY_DELAY_MS);
+        odrvAxisState(node, 8 /*CLOSED_LOOP*/);
+        delay(50);
+        if (odrvReadEncoderZero(node, zero)) return true;
     }
     return false;
 }
@@ -471,7 +517,6 @@ static volatile ArmOperatingMode s_arm_requested_mode = ArmOperatingMode::DEXTER
 static uint8_t  s_arm_fault_code = 0;
 static uint16_t s_arm_can_fail   = 0;
 static uint16_t s_arm_motor_fail = 0;
-static uint16_t s_arm_presence_mask = 0;
 static uint32_t s_arm_fail_win   = 0;       // window start (millis); 0 = inactive
 static bool     s_arm_first_cmd  = true;    // first cmd after arm → ±J4 clamp
 #if ARM_RAMP_ENABLE
@@ -483,8 +528,11 @@ static bool     s_arm_ramp_init   = false;
 static uint32_t s_arm_ramp_last   = 0;
 #endif
 static uint32_t s_arm_last_cmd_ms = 0;
+static float    s_arm_hold_pos[6] = {0, 0, 0, 0, 0, 0};  // last per-joint output (deg) sent to the motors
+static bool     s_arm_estop_hold  = false;               // true while an e-stop is holding the arm energized
 
-// Best-effort disable of every arm motor (used by e-stop, disarm and fault).
+// Best-effort disable of every arm motor (used by disarm and latched faults —
+// and e-stop only when ARM_ESTOP_HOLD is 0).
 static void disableArmMotors() {
     for (uint8_t j = 0; j < ODRIVE_NUM_JOINTS; j++) {
 #if ODRIVE_ESTOP_USE_NATIVE
@@ -495,6 +543,47 @@ static void disableArmMotors() {
     }
     for (uint8_t j = 0; j < LKTECH_NUM_JOINTS; j++) lkMotorStop(s_lk_id[j]);
     zeDisableOutput(ZE300_ID_J4);
+}
+
+// E-stop HOLD: freeze every arm joint at its last commanded pose with the motors
+// still ENERGIZED, so the arm stays put instead of dropping under gravity. Just
+// re-issues the last output to each controller's position loop (never IDLE /
+// motor-off / output-disable). The controllers hold autonomously between calls;
+// because the arm control tick re-invokes this every loop while in ESTOP, the
+// hold is also continuously re-affirmed (throttled to the normal command cadence
+// so it does not flood the MCP2515 TX buffers). The wrist is only re-commanded in
+// DEXTERITY mode — in CHASSIS mode J5/J6 are intentionally torque-off (parked),
+// so e-stop leaves them off rather than re-energizing them.
+static void holdArmMotors() {
+    uint32_t now = millis();
+    if (s_arm_last_cmd_ms != 0 && now - s_arm_last_cmd_ms < ARM_COMMAND_PERIOD_MS)
+        return;                       // controllers already hold between re-sends
+    s_arm_last_cmd_ms = now;
+
+    static constexpr float DEG2RAD  = 3.14159265359f / 180.0f;
+    static constexpr float TWO_PI_F = 6.28318530718f;
+    const float* out = s_arm_hold_pos;
+
+    // J1–J3: ODrive SET_INPUT_POS (turns), offset by boot-pose zero.
+    for (uint8_t j = 0; j < ODRIVE_NUM_JOINTS; j++) {
+        float turns = s_odrv_zero[j] + (out[j] * DEG2RAD / TWO_PI_F) * s_odrv_gear[j] * s_odrv_dir[j];
+        odrvInputPos(s_odrv_node[j], turns);
+    }
+    // J4: ZE300 ABSOLUTE_POSITION (output counts).
+    {
+        float out_deg = out[3] * ZE300_DIR_J4;
+        int32_t counts = s_ze_zero_counts +
+            (int32_t)(out_deg * (float)ZE300_COUNTS_PER_REV / 360.0f);
+        zeSendAbsPosition(ZE300_ID_J4, counts);
+    }
+    // J5–J6: LKTech MULTI_LOOP_CONTROL_2 (motor centidegrees), DEXTERITY only.
+    if (s_arm_mode == ArmOperatingMode::DEXTERITY) {
+        for (uint8_t j = 0; j < LKTECH_NUM_JOINTS; j++) {
+            float motor_deg = out[4 + j] * s_lk_gear[j] * s_lk_dir[j];
+            int64_t cdeg = s_lk_zero_cdeg[j] + (int64_t)(motor_deg * 100.0f);
+            lkSendPosition(s_lk_id[j], (int32_t)cdeg, LKTECH_DEFAULT_SPEED_DPS);
+        }
+    }
 }
 
 // Latch a fault: disable motors and reject motion until an explicit re-arm.
@@ -528,6 +617,8 @@ static bool applyArmOperatingMode(ArmOperatingMode mode) {
             delay(20);
             ok &= lkReadMultiAngle(s_lk_id[j], current_cdeg[j]);
         }
+        for (uint8_t j = 0; j < LKTECH_NUM_JOINTS && ok; j++)
+            ok &= lkSendPosition(s_lk_id[j], (int32_t)current_cdeg[j], LKTECH_DEFAULT_SPEED_DPS);
         if (!ok) {
             enterArmFault(2 /*motor_cmd*/);
             return false;
@@ -567,6 +658,7 @@ static bool armArmInternal() {
     s_arm_motor_fail = 0;
     s_arm_presence_mask = 0;
     s_arm_fail_win   = 0;
+    s_arm_estop_hold = false;   // a fresh arm clears any lingering e-stop hold
     bool ok = true;
 
     // ODrive: clear errors → closed loop → capture zero (with retries).
@@ -576,12 +668,7 @@ static bool armArmInternal() {
 
     for (uint8_t j = 0; j < ODRIVE_NUM_JOINTS; j++) {
         float zero = 0.0f; bool zeroed = false;
-        for (uint8_t a = 0; a < ODRIVE_INIT_MAX_RETRIES && !zeroed; a++) {
-            if (a > 0) delay(ODRIVE_INIT_RETRY_DELAY_MS);
-            odrvAxisState(s_odrv_node[j], 8 /*CLOSED_LOOP*/);
-            delay(50);
-            zeroed = odrvReadEncoderZero(s_odrv_node[j], zero);
-        }
+        zeroed = odrvInitAndReadZero(s_odrv_node[j], zero);
         s_odrv_zero[j] = zeroed ? zero : 0.0f;
         if (zeroed) s_arm_presence_mask |= (uint16_t)(1U << j);
         if (!zeroed && failed_stage == 0) failed_stage = 10 + j;  // 10..12 = ODrive J1..J3
@@ -601,6 +688,11 @@ static bool armArmInternal() {
         if (zeroed) s_arm_presence_mask |= (uint16_t)(1U << (4 + j));
         if (!zeroed && failed_stage == 0) failed_stage = 20 + j;  // 20..21 = LKTech J5..J6
         ok &= zeroed;
+        if (zeroed && s_arm_mode == ArmOperatingMode::DEXTERITY) {
+            bool held = lkSendPosition(s_lk_id[j], (int32_t)zero, LKTECH_DEFAULT_SPEED_DPS);
+            if (!held && failed_stage == 0) failed_stage = 22 + j; // 22..23 = LKTech hold J5..J6
+            ok &= held;
+        }
     }
 
     // ZE300: set max speed → capture absolute zero (with retries).
@@ -650,17 +742,29 @@ bool CANInterface::begin() {
     if (!canBackendBegin()) { s_ok = false; return false; }
     s_ok = true;
     s_arm_state = ArmState::UNINIT;        // passive boot — the arm is DISARMED
-#if !ARM_PASSIVE_BOOT
+#if ROBOCOREA_ROLE_IS_ARM && !ARM_PASSIVE_BOOT
     armArmInternal();                      // legacy: auto-arm the arm at boot
 #endif
     return true;
 }
 
-void CANInterface::requestArm()    { s_arm_req_arm = true; }
-void CANInterface::requestDisarm() { s_arm_req_disarm = true; }
+void CANInterface::requestArm() {
+#if ROBOCOREA_ROLE_IS_ARM
+    s_arm_req_arm = true;
+#endif
+}
+void CANInterface::requestDisarm() {
+#if ROBOCOREA_ROLE_IS_ARM
+    s_arm_req_disarm = true;
+#endif
+}
 void CANInterface::requestOperatingMode(ArmOperatingMode mode) {
+#if ROBOCOREA_ROLE_IS_ARM
     s_arm_requested_mode = mode;
     s_arm_req_mode = true;
+#else
+    (void)mode;
+#endif
 }
 uint8_t CANInterface::armState()   { return (uint8_t)s_arm_state; }
 uint8_t CANInterface::armOperatingMode() { return (uint8_t)s_arm_mode; }
@@ -680,28 +784,66 @@ void CANInterface::getArmLifecycle(ArmLifecyclePayload& out) {
 bool CANInterface::isOk() { return s_ok; }
 
 bool CANInterface::sendTrackSpeeds(float left_norm, float right_norm) {
+#if !ROBOCOREA_ROLE_IS_CHASSIS
+    (void)left_norm; (void)right_norm;
+    return true;
+#else
     if (!s_ok) return false;
     left_norm  = clampf(left_norm,  -1.0f, 1.0f);
     right_norm = clampf(right_norm, -1.0f, 1.0f);
     bool ok = vescSendRpm(s_traction_id[0], (int32_t)(left_norm  * TRACTION_ERPM_MAX * s_traction_dir[0]));
     ok    &= vescSendRpm(s_traction_id[1], (int32_t)(right_norm * TRACTION_ERPM_MAX * s_traction_dir[1]));
     return ok;
+#endif
 }
 
 bool CANInterface::sendFlipperAngles(const float target_deg[4], bool enabled) {
+#if !ROBOCOREA_ROLE_IS_CHASSIS
+    (void)target_deg; (void)enabled;
+    return true;
+#else
     if (!s_ok) return false;
     bool ok = true;
+#if FLIPPER_USE_LEGACY_RPM_LISP
+    // Fake-RPM flipper Lisp reads the VESC RPM setpoint as:
+    //   target_degrees = get-rpm-set / 1000
+    // It has no measured-angle report and no enable/coast bit. When disabled,
+    // command target 0 to match the old 5.ino failsafe/e-stop behavior.
+    for (uint8_t i = 0; i < 4; i++) {
+        float command_deg = enabled ? target_deg[i] : 0.0f;
+        ok &= vescSendRpm(s_flipper_id[i], (int32_t)lroundf(command_deg * 1000.0f));
+
+#if !FLIPPER_USE_TACH_FEEDBACK
+        // No measured-angle report in fake-RPM mode: the lisp faithfully tracks
+        // this commanded target, so it IS the reported flipper angle. Wrap to
+        // [0,360) for clean /encoders/flipper telemetry (and so the int16×10 wire
+        // field never overflows). The control accumulator in Control stays
+        // continuous, so the lisp setpoint sent above is still continuous.
+        portENTER_CRITICAL(&s_vesc_mux);
+        s_flipper_deg[i]    = wrap360(command_deg);
+        s_flipper_deg_ok[i] = true;
+        portEXIT_CRITICAL(&s_vesc_mux);
+#endif
+    }
+#else
     // Targets are absolute angles in the VESC's own (lisp-measured) frame; no
     // direction sign here — operator direction is applied to the stick rate in
     // Control. The lisp wraps internally; we wrap too for a clean wire value.
     for (uint8_t i = 0; i < 4; i++)
         ok &= vescSendFlipperTarget(s_flipper_id[i], wrap360(target_deg[i]), enabled);
+#endif
     return ok;
+#endif
 }
 
 bool CANInterface::sendArmJoints(const float angles_deg_in[6]) {
+#if !ROBOCOREA_ROLE_IS_ARM
+    (void)angles_deg_in;
+    return true;
+#else
     if (!s_ok) return false;
     if (s_arm_state != ArmState::READY) return false;   // gated: arm must be armed
+    if (s_arm_estop_hold) return true;                  // e-stop hold: keep the freeze, ignore new commands
     uint32_t now = millis();
     if (s_arm_last_cmd_ms != 0 && now - s_arm_last_cmd_ms < ARM_COMMAND_PERIOD_MS)
         return true;
@@ -774,16 +916,22 @@ bool CANInterface::sendArmJoints(const float angles_deg_in[6]) {
         }
     }
 
+    // Remember the actual output so an e-stop can freeze the arm right here.
+    for (uint8_t j = 0; j < 6; j++) s_arm_hold_pos[j] = out[j];
+
     if (ok && s_arm_first_cmd) s_arm_first_cmd = false;
     noteArmSendResult(ok);
     return ok;
+#endif
 }
 
 void CANInterface::poll() {
+#if ROBOCOREA_ROLE_IS_ARM
     // Service arm lifecycle requests here — the bring-up blocks for ~seconds, so
     // it must run in the CAN task, never the 50 Hz control loop.
     if (s_arm_req_disarm) {
         s_arm_req_disarm = false;
+        s_arm_estop_hold = false;   // explicit disarm overrides an e-stop hold
         disableArmMotors();
         if (s_arm_state != ArmState::FAULT) s_arm_state = ArmState::UNINIT;
     }
@@ -796,6 +944,7 @@ void CANInterface::poll() {
         s_arm_req_mode = false;
         applyArmOperatingMode(s_arm_requested_mode);
     }
+#endif
 
     // Bus health / fault recovery first, so a BUS_OFF (or MCP fault) can recover
     // even though the rest of poll() and the senders bail out while !s_ok.
@@ -811,6 +960,7 @@ void CANInterface::poll() {
 
     CanFrame f;
     while (canReceive(f)) {
+        noteArmPresenceFromRxFrame(f);
         if (f.rtr) continue;
 
         // ── Extended frames: VESC status + flipper-lisp reports ─────────────
@@ -856,9 +1006,25 @@ void CANInterface::poll() {
                     break;
                 case 27:  // STATUS_5: tachometer (i32 BE), v_in (i16 BE)
                     if (f.dlc >= 6) {
-                        s_vesc[i].tacho   = getInt32BE(f.data);
+                        int32_t tach      = getInt32BE(f.data);
+                        s_vesc[i].tacho   = tach;
                         s_vesc[i].v_in_10 = getInt16BE(f.data + 4);
                         s_vesc[i].fresh = true;
+#if FLIPPER_USE_TACH_FEEDBACK
+                        for (uint8_t k = 0; k < 4; k++) {
+                            if (s_flipper_id[k] != id) continue;
+                            if (!s_flipper_tach_zero_ok[k]) {
+                                s_flipper_tach_zero_count[k] = tach;
+                                s_flipper_tach_zero_ok[k] = true;
+                            }
+                            int64_t delta = (int64_t)tach - (int64_t)s_flipper_tach_zero_count[k];
+                            float deg = s_flipper_tach_zero_deg[k] +
+                                        (float)delta * s_flipper_tach_deg_per_count[k];
+                            s_flipper_deg[k] = wrap360(deg);
+                            s_flipper_deg_ok[k] = true;
+                            break;
+                        }
+#endif
                     }
                     break;
                 default: break;
@@ -867,6 +1033,9 @@ void CANInterface::poll() {
             continue;
         }
 
+#if !ROBOCOREA_ROLE_IS_ARM
+        continue;
+#else
         uint8_t node = (f.id >> 5) & 0x3F;
         uint8_t cmd  = f.id & 0x1F;
 
@@ -948,8 +1117,10 @@ void CANInterface::poll() {
             }
             continue;
         }
+#endif
     }
 
+#if ROBOCOREA_ROLE_IS_ARM
     // ── One ODrive telemetry RTR per poll (round-robin) ─────────────────────
     {
         uint8_t j = s_odrv_telem_slot / ODRV_TELEM_COUNT;
@@ -968,11 +1139,16 @@ void CANInterface::poll() {
             zeReadRealtimeState(ZE300_ID_J4);
         }
     }
+#endif
 
 }
 
 // ─── Derived drivetrain feedback ──────────────────────────────────────────────
 void CANInterface::getTractionSpeeds(float& left_rpm, float& right_rpm) {
+#if !ROBOCOREA_ROLE_IS_CHASSIS
+    left_rpm = 0.0f;
+    right_rpm = 0.0f;
+#else
     int il = vescIdToIndex(s_traction_id[0]);
     int ir = vescIdToIndex(s_traction_id[1]);
     portENTER_CRITICAL(&s_vesc_mux);
@@ -983,23 +1159,37 @@ void CANInterface::getTractionSpeeds(float& left_rpm, float& right_rpm) {
     const float k = 1.0f / ((float)VESC_POLE_PAIRS * DRIVE_GEAR_RATIO);
     left_rpm  = el * k * s_traction_dir[0];
     right_rpm = er * k * s_traction_dir[1];
+#endif
 }
 
-// Flipper angle now comes from the VESC lisp (it owns the position loop), not the
-// ESP-side tachometer. Returns the last reported wrapped angle, 0 until first report.
+// Flipper angle comes from STATUS_5 tachometer when FLIPPER_USE_TACH_FEEDBACK is
+// enabled, otherwise from the custom Lisp report or command estimate.
 void CANInterface::getFlipperAngles(float out_deg[4]) {
+#if !ROBOCOREA_ROLE_IS_CHASSIS
+    for (uint8_t i = 0; i < 4; i++) out_deg[i] = 0.0f;
+#else
     portENTER_CRITICAL(&s_vesc_mux);
     for (uint8_t i = 0; i < 4; i++)
         out_deg[i] = s_flipper_deg_ok[i] ? s_flipper_deg[i] : 0.0f;
     portEXIT_CRITICAL(&s_vesc_mux);
+#endif
 }
 
 // ─── Raw status accessors ─────────────────────────────────────────────────────
 uint8_t CANInterface::vescIdByIndex(uint8_t idx) {
+#if !ROBOCOREA_ROLE_IS_CHASSIS
+    (void)idx;
+    return 0;
+#else
     return (idx < 6) ? s_vesc_id[idx] : 0;
+#endif
 }
 
 bool CANInterface::getVescStatus(uint8_t vesc_id, VescStatusPayload& out) {
+#if !ROBOCOREA_ROLE_IS_CHASSIS
+    (void)vesc_id; (void)out;
+    return false;
+#else
     int idx = vescIdToIndex(vesc_id);
     if (idx < 0) return false;
     uint8_t i = (uint8_t)idx;
@@ -1016,9 +1206,14 @@ bool CANInterface::getVescStatus(uint8_t vesc_id, VescStatusPayload& out) {
     s_vesc[i].fresh   = false;
     portEXIT_CRITICAL(&s_vesc_mux);
     return true;
+#endif
 }
 
 bool CANInterface::getOdriveStatus(uint8_t joint_idx, OdriveStatusPayload& out) {
+#if !ROBOCOREA_ROLE_IS_ARM
+    (void)joint_idx; (void)out;
+    return false;
+#else
     if (joint_idx >= ODRIVE_NUM_JOINTS) return false;
     portENTER_CRITICAL(&s_odrv_mux);
     if (!s_odrv_fb[joint_idx].fresh) { portEXIT_CRITICAL(&s_odrv_mux); return false; }
@@ -1031,9 +1226,14 @@ bool CANInterface::getOdriveStatus(uint8_t joint_idx, OdriveStatusPayload& out) 
     s_odrv_fb[joint_idx].fresh = false;
     portEXIT_CRITICAL(&s_odrv_mux);
     return true;
+#endif
 }
 
 bool CANInterface::getLktechStatus(uint8_t joint_idx, LktechStatusPayload& out) {
+#if !ROBOCOREA_ROLE_IS_ARM
+    (void)joint_idx; (void)out;
+    return false;
+#else
     if (joint_idx >= LKTECH_NUM_JOINTS) return false;
     portENTER_CRITICAL(&s_lk_mux);
     if (!s_lk_fb[joint_idx].fresh) { portEXIT_CRITICAL(&s_lk_mux); return false; }
@@ -1047,9 +1247,14 @@ bool CANInterface::getLktechStatus(uint8_t joint_idx, LktechStatusPayload& out) 
     s_lk_fb[joint_idx].fresh = false;
     portEXIT_CRITICAL(&s_lk_mux);
     return true;
+#endif
 }
 
 bool CANInterface::getZe300Status(Ze300StatusPayload& out) {
+#if !ROBOCOREA_ROLE_IS_ARM
+    (void)out;
+    return false;
+#else
     portENTER_CRITICAL(&s_ze_mux);
     if (!s_ze_fb.fresh) { portEXIT_CRITICAL(&s_ze_mux); return false; }
     out.device_id          = ZE300_ID_J4;
@@ -1066,12 +1271,19 @@ bool CANInterface::getZe300Status(Ze300StatusPayload& out) {
     s_ze_fb.fresh = false;
     portEXIT_CRITICAL(&s_ze_mux);
     return true;
+#endif
 }
 
-uint8_t CANInterface::odriveNodeCount() { return ODRIVE_NUM_JOINTS; }
+uint8_t CANInterface::odriveNodeCount() {
+#if ROBOCOREA_ROLE_IS_ARM
+    return ODRIVE_NUM_JOINTS;
+#else
+    return 0;
+#endif
+}
 
 bool CANInterface::getOdriveError(uint8_t node_idx, OdriveErrorPayload& out) {
-#if ODRIVE_ENABLE_ERROR_POLL
+#if ODRIVE_ENABLE_ERROR_POLL && ROBOCOREA_ROLE_IS_ARM
     if (node_idx >= ODRIVE_NUM_JOINTS) return false;
     portENTER_CRITICAL(&s_odrv_err_mux);
     if (!s_odrv_err[node_idx].fresh) { portEXIT_CRITICAL(&s_odrv_err_mux); return false; }
@@ -1086,18 +1298,44 @@ bool CANInterface::getOdriveError(uint8_t node_idx, OdriveErrorPayload& out) {
 }
 
 // ─── Arm e-stop / recovery ────────────────────────────────────────────────────
-// E-stop DISARMS the arm (de-energise + drop to UNINIT). Under the passive-safety
-// model the arm then stays disarmed until an explicit re-arm (MSG_ARM_INIT) — it
-// is never silently re-energised by clearing the e-stop.
+// With ARM_ESTOP_HOLD (default): e-stop FREEZES the armed arm at its last pose
+// with the motors energized (so it cannot fall), and clearing the e-stop resumes
+// motion in place — no re-arm needed. With ARM_ESTOP_HOLD=0 (legacy): e-stop
+// DISARMS the arm (de-energise + drop to UNINIT) and, under the passive-safety
+// model, it stays disarmed until an explicit re-arm (MSG_ARM_INIT). Either way an
+// un-armed arm has nothing to hold, and a latched FAULT always de-energises.
 void CANInterface::estopArm() {
+#if ROBOCOREA_ROLE_IS_ARM
     if (!s_ok) return;
+#if ARM_ESTOP_HOLD
+    // Hold the arm where it is, motors energized, so it does not fall. The arm
+    // control tick calls this every loop while in ESTOP, so the hold is
+    // continuously re-affirmed. Keep the lifecycle state untouched (the motors
+    // stay armed/energized); sendArmJoints() is blocked while s_arm_estop_hold is
+    // set, and clearEstopArm() resumes seamlessly without a re-arm. A FAULT can
+    // still escalate to disableArmMotors() independently. If the arm was never
+    // armed (UNINIT/INITIALIZING/FAULT) there is nothing energized to hold.
+    if (s_arm_state == ArmState::READY) {
+        s_arm_estop_hold = true;
+        holdArmMotors();
+    } else {
+        disableArmMotors();
+    }
+#else
+    // Legacy behaviour: de-energize every joint (the arm will droop) and disarm.
     disableArmMotors();
     s_arm_state = ArmState::UNINIT;
+#endif
+#endif
 }
 
 void CANInterface::clearEstopArm() {
-    // Intentionally does NOT re-arm. Clearing the e-stop only lifts the stop
-    // condition; re-arm the arm motors explicitly via requestArm() (MSG_ARM_INIT)
-    // once it is safe. (Set ARM_PASSIVE_BOOT 0 + call requestArm here for the old
-    // auto-recover behaviour.)
+#if ROBOCOREA_ROLE_IS_ARM
+    // With ARM_ESTOP_HOLD the motors stayed energized at the hold pose, so simply
+    // lift the hold and joint commands flow again (the firmware ramp eases the arm
+    // from the hold pose toward the live target). When holding was not engaged
+    // this is a no-op: re-arm explicitly via requestArm() (MSG_ARM_INIT). (Set
+    // ARM_PASSIVE_BOOT 0 + call requestArm here for the old auto-recover.)
+    s_arm_estop_hold = false;
+#endif
 }

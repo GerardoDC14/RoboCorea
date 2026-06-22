@@ -10,8 +10,8 @@
 // ~/.config/robocorea_gui/settings.json.
 //
 // Atomic members are safe to read directly from worker threads (thermal render,
-// video workers). Non-atomic members (video_streams, vosk_grammar, keybind,
-// ppm_calib) must be accessed under their respective mutex.
+// video workers). Non-atomic members (video_streams, vosk_grammar, ppm_calib)
+// must be accessed under their respective mutex.
 struct AppSettings {
     static AppSettings& instance() {
         static AppSettings s;
@@ -64,6 +64,16 @@ struct AppSettings {
     // Comma-separated Vosk vocabulary; empty = unrestricted recognition.
     std::mutex   strings_mutex;
     std::string  vosk_grammar;
+
+    // (The per-channel keybind table was removed — the RC uses a fixed control
+    // scheme hardcoded in the firmware. Only PPM calibration is configurable.)
+
+    // ── RC PPM calibration (pushed as MSG_PPM_CALIB via /robot/ppm_calib) ─────
+    // Per-channel min / neutral / max in raw µs (6 channels). The firmware maps
+    // raw PPM into the calibrated range to produce a normalized [-1,1] stick.
+    struct PpmChannelCalib { int min_us{1000}, neutral_us{1500}, max_us{2000}; };
+    std::mutex      ppm_calib_mutex;
+    PpmChannelCalib ppm_calib[6] = {};
 
 private:
     AppSettings() = default;

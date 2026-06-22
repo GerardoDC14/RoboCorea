@@ -15,15 +15,26 @@
 
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
+  <depend>rescue_interfaces</depend>
   <depend>urdf</depend>
 
   <!-- Qt6 (Widgets + OpenGL), OpenCV, Assimp, ONNX Runtime and ZBar are resolved
        by CMake find_package, not rosdep keys. OpenCV MUST be built with GStreamer
        support for the SRT video path; ONNX Runtime is installed under /usr/local
        (see README). -->
+
+  <!-- Workstation bring-up (launch/bringup.launch.py) orchestrates the whole
+       operator stack: robot_state_publisher + the arm_teleop servo/flipper_state
+       (+ arm_description URDF), optionally joystick teleop and RViz. -->
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>arm_teleop</exec_depend>
+  <exec_depend>arm_description</exec_depend>
+  <exec_depend>joy</exec_depend>
+  <exec_depend>rviz2</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
 

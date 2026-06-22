@@ -1,0 +1,5 @@
+# Remove a saved pose by name.
+string name
+---
+bool success
+string message

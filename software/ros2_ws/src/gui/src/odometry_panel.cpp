@@ -5,8 +5,25 @@
 
 #include <cmath>
 
-// VESC IDs per architecture.md §8.1 (traction L/R = 1/2, flippers FL/FR/RL/RR = 3-6).
-static const char* VESC_NAMES[7] = {"?", "TL", "TR", "FL", "FR", "RL", "RR"};
+// VESC table rows. The real CAN IDs (firmware config.h / architecture.md §8.1)
+// are NOT contiguous 1..6 — traction L/R = 60/50, flippers FL/FR/RL/RR =
+// 20/10/40/30 — so an incoming status frame must be mapped to a fixed row slot
+// by its CAN id (vescIdToSlot below), NOT used as a row index directly. Slot
+// order: 1=TL 2=TR 3=FL 4=FR 5=RL 6=RR.
+struct VescSlot { const char* name; int can_id; };
+static const VescSlot VESC_SLOTS[7] = {
+    {"?", -1},                                              // slot 0 unused
+    {"TL", 60}, {"TR", 50}, {"FL", 20}, {"FR", 10}, {"RL", 40}, {"RR", 30},
+};
+
+// Map a raw VESC CAN id (as forwarded in /motors/vesc_status[0]) to its table
+// row slot 1..6, or 0 if it isn't one of the six known VESCs.
+static int vescIdToSlot(int can_id) {
+    for (int s = 1; s <= 6; ++s)
+        if (VESC_SLOTS[s].can_id == can_id) return s;
+    return 0;
+}
+
 static const char* ARM_NAMES[7]  = {"?", "J1", "J2", "J3", "J4", "J5", "J6"};
 
 OdometryPanel::OdometryPanel(rclcpp::Node::SharedPtr node, QWidget* parent)
@@ -203,7 +220,9 @@ void OdometryPanel::buildLayout()
         for (int id = 1; id <= 6; ++id) {
             auto* row = new QGridLayout();
             row->setSpacing(2);
-            row->addWidget(makeAxisLabel(VESC_NAMES[id]), 0, 0);
+            // Label the row with the friendly name + the real CAN id (e.g. "TL·60").
+            row->addWidget(makeAxisLabel(
+                QString("%1·%2").arg(VESC_SLOTS[id].name).arg(VESC_SLOTS[id].can_id)), 0, 0);
             vesc_rows_[id].erpm       = makeValueLabel("--");
             vesc_rows_[id].current    = makeValueLabel("--");
             vesc_rows_[id].duty       = makeValueLabel("--");
@@ -325,14 +344,18 @@ void OdometryPanel::onFlagsUpdated(int flags)
     if (flags & 0x02) parts << "SENS";
     if (flags & 0x04) parts << "CAN";
     if (flags & 0x08) parts << "ESTOP";
+    if (flags & 0x10) parts << "REVERSE";   // Ch6-up virtual flip (drive from other end)
     flags_label_->setText(parts.isEmpty() ? "none" : parts.join(" | "));
 }
 
 void OdometryPanel::onVescStatusUpdated(int id, float erpm, float current, float duty,
                                         float temp_fet, float temp_motor)
 {
-    if (id < 1 || id > 6) return;
-    auto& row = vesc_rows_[id];
+    // `id` is the raw VESC CAN id (60/50/20/10/40/30), not a 1..6 row index — map
+    // it to the right table slot. Unknown ids (not one of the six VESCs) are dropped.
+    const int slot = vescIdToSlot(id);
+    if (slot == 0) return;
+    auto& row = vesc_rows_[slot];
     row.erpm->setText(QString::number(static_cast<int>(erpm)));
     row.current->setText(QString::number(current, 'f', 1) + "A");
     row.duty->setText(QString::number(duty * 100.0f, 'f', 0) + "%");

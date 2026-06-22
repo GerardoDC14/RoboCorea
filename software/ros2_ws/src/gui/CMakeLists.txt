@@ -14,9 +14,11 @@ set(CMAKE_AUTOUIC ON)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)                             # arm lifecycle Trigger services
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(rescue_interfaces REQUIRED)                     # saved-pose services
 find_package(ament_index_cpp REQUIRED)
 find_package(urdf REQUIRED)                                  # digital twin: URDF parse
 find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGL OpenGLWidgets)  # twin: GL view
@@ -58,6 +60,9 @@ set(GUI_SOURCES
   src/odometry_panel.cpp
   src/speech_processor.cpp
   src/urdf_viewer.cpp
+  src/arm_pose_panel.cpp
+  src/settings_dialog.cpp
+  src/ppm_calib_dialog.cpp
   src/filters.cpp
   # Headers listed so AUTOMOC processes the Q_OBJECT classes.
   include/gui/main_window.hpp
@@ -68,7 +73,10 @@ set(GUI_SOURCES
   include/gui/odometry_panel.hpp
   include/gui/speech_processor.hpp
   include/gui/urdf_viewer.hpp
+  include/gui/arm_pose_panel.hpp
   include/gui/digital_twin_panel.hpp
+  include/gui/settings_dialog.hpp
+  include/gui/ppm_calib_dialog.hpp
 )
 if(GST_FOUND)
   list(APPEND GUI_SOURCES src/gst_av_stream.cpp)
@@ -112,9 +120,11 @@ endif()
 ament_target_dependencies(gui
   rclcpp
   std_msgs
+  std_srvs
   sensor_msgs
   geometry_msgs
   nav_msgs
+  rescue_interfaces
   urdf
   ament_index_cpp
 )

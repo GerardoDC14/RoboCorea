@@ -7,8 +7,11 @@ from launch_ros.actions import Node
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
-            'serial_port', default_value='/dev/ttyUSB0',
-            description='Serial device for the ESP32'),
+            'serial_port', default_value='',
+            description='Optional explicit ESP32 serial device; empty means scan serial_candidates.'),
+        DeclareLaunchArgument(
+            'serial_candidates', default_value='/dev/serial/by-id/*,/dev/serial/by-path/*',
+            description='Comma-separated allowlist of serial device paths/globs to probe for ESP32 boards.'),
         DeclareLaunchArgument(
             'baud_rate', default_value='921600',
             description='UART baud rate (must match MINIPC_BAUD in config.h)'),
@@ -19,7 +22,8 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'serial_port': LaunchConfiguration('serial_port'),
-                'baud_rate':   LaunchConfiguration('baud_rate'),
+                'serial_candidates': LaunchConfiguration('serial_candidates'),
+                'baud_rate': LaunchConfiguration('baud_rate'),
             }],
         ),
     ])

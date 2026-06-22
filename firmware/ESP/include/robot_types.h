@@ -7,53 +7,15 @@
 enum class RobotMode : uint8_t {
     INIT    = 0,  // startup / hardware init
     STANDBY = 1,  // idle, waiting for the RC link
-    NORMAL  = 2,  // RC drives the tracks (and any flippers bound in the row)
-    ARM     = 3,  // tracks stopped; arm follows joint commands from the PC
+    NORMAL  = 2,  // RC drives the tracks + flippers (fixed scheme); arm relayed
+    ARM     = 3,  // (reserved — RC no longer has a dedicated arm mode)
     ESTOP   = 4,  // all outputs neutralised; cleared by PC or hardware
-    FLIPPER = 5,  // RC drives flippers only (position control)
+    FLIPPER = 5,  // (reserved — drive + flippers are always active together now)
 };
 
-// ─── Channel function (keybind system) ───────────────────────────────────────
-// What a PPM channel can be bound to. Values match the GUI enum.
-enum class ChannelFunction : uint8_t {
-    NONE          = 0,
-    TRACTION_FWD  = 1,   // forward / back
-    TRACTION_TURN = 2,   // left / right differential
-    FLIPPER_ALL   = 3,   // all four flippers together
-    FLIPPER_FL    = 4,   // front-left
-    FLIPPER_FR    = 5,   // front-right
-    FLIPPER_RL    = 6,   // rear-left
-    FLIPPER_RR    = 7,   // rear-right
-    ARM_FWD       = 8,   // generic arm (legacy)
-    ESTOP         = 9,   // virtual e-stop
-    ARM_X         = 10,  // arm Cartesian +X
-    ARM_Y         = 11,  // arm Cartesian +Y
-    ARM_Z         = 12,  // arm Cartesian +Z
-    ARM_PITCH     = 13,
-    ARM_YAW       = 14,
-    ARM_ROLL      = 15,
-    GRIPPER       = 16,  // gripper open/close (forwarded to the PC)
-};
-
-inline bool isArmFunction(ChannelFunction fn) {
-    return fn == ChannelFunction::ARM_FWD   ||
-           fn == ChannelFunction::ARM_X     ||
-           fn == ChannelFunction::ARM_Y     ||
-           fn == ChannelFunction::ARM_Z     ||
-           fn == ChannelFunction::ARM_PITCH ||
-           fn == ChannelFunction::ARM_YAW   ||
-           fn == ChannelFunction::ARM_ROLL  ||
-           fn == ChannelFunction::GRIPPER;
-}
-
-inline bool isFlipperFunction(ChannelFunction fn) {
-    return fn >= ChannelFunction::FLIPPER_ALL && fn <= ChannelFunction::FLIPPER_RR;
-}
-
-// Keybind table: 3 Ch5 lever positions × 5 channel slots (Ch1,Ch2,Ch3,Ch4,Ch6).
-struct KeybindTable {
-    ChannelFunction map[3][5];
-};
+// The per-channel keybind table (ChannelFunction enum / KeybindTable) was removed
+// when the RC moved to a single FIXED control scheme — see config.h "Channel
+// roles" and Control::applyControl(). MSG_KEYBIND (0x14) is now reserved-unused.
 
 // ─── PPM / RC ────────────────────────────────────────────────────────────────
 struct PPMFrame {
@@ -82,6 +44,7 @@ struct SystemStatus {
     bool      can_ok;
     uint8_t   sensor_mask;
     bool      estop;
+    bool      virtual_flip;     // Ch6-up "drive from the other end" active
     uint32_t  uptime_ms;
 };
 
@@ -90,7 +53,7 @@ struct SystemStatus {
 
 struct TelemetryPayload {
     uint8_t  mode;                 // RobotMode value
-    uint8_t  flags;                // bit0=ppm_ok bit1=sensors bit2=can_ok bit3=estop
+    uint8_t  flags;                // bit0=ppm_ok bit1=sensors bit2=can_ok bit3=estop bit4=vflip
     uint16_t ppm[PPM_CHANNELS];    // raw µs per channel
     int16_t  speed_left;           // track RPM × 10
     int16_t  speed_right;          // track RPM × 10
@@ -120,10 +83,8 @@ struct EncoderExtPayload {
     int16_t flipper_rr_deg10;
 };
 
-// 15 bytes: 3 modes (Ch5 positions) × 5 slots (Ch1,Ch2,Ch3,Ch4,Ch6).
-struct KeybindPayload {
-    uint8_t map[3][5];
-};
+// (KeybindPayload removed — MSG_KEYBIND 0x14 is reserved-unused; the RC uses a
+// fixed control scheme, see config.h "Channel roles" + Control::applyControl().)
 
 // Per-VESC status (one frame per controller that broadcasts).
 struct VescStatusPayload {
@@ -193,6 +154,14 @@ struct GripperPayload {
     int16_t value_1000;            // normalised × 1000 (−1000..+1000)
 };
 
+// Board identity. Sent at startup and periodically so the Jetson can discover
+// which USB serial port belongs to the chassis PCB versus the arm PCB.
+struct BoardIdentityPayload {
+    uint8_t  role;                 // ROBOCOREA_BOARD_ROLE_CHASSIS / _ARM
+    uint8_t  protocol_version;     // ROBOCOREA_PROTOCOL_VERSION
+    uint16_t capabilities;         // BOARD_CAP_* bitmask
+};
+
 // Arm safety lifecycle + fault diagnostics (ESP → PC).
 struct ArmLifecyclePayload {
     uint8_t  state;                // 0 UNINIT, 1 INITIALIZING, 2 READY, 3 FAULT
@@ -220,8 +189,8 @@ static_assert(sizeof(OdriveErrorPayload) ==  9, "OdriveErrorPayload size");
 static_assert(sizeof(LktechStatusPayload) == 11, "LktechStatusPayload size");
 static_assert(sizeof(Ze300StatusPayload) == 14, "Ze300StatusPayload size");
 static_assert(sizeof(GripperPayload)     ==  2, "GripperPayload size");
+static_assert(sizeof(BoardIdentityPayload) == 4, "BoardIdentityPayload size");
 static_assert(sizeof(ArmLifecyclePayload) == 11, "ArmLifecyclePayload size");
 static_assert(sizeof(ArmJointsPayload)   == 12, "ArmJointsPayload size");
-static_assert(sizeof(KeybindPayload)     == 15, "KeybindPayload size");
 static_assert(sizeof(PpmCalibPayload)    == 38, "PpmCalibPayload size");
 static_assert(sizeof(SensorEnablePayload) == 1, "SensorEnablePayload size");

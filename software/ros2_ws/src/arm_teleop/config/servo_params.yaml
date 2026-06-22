@@ -12,9 +12,9 @@ servo_node:
     auto_start: true         # begin running immediately (keyboard_servo needs this)
 
     # Command scaling: teleop nodes emit [-1, 1]; these set full-deflection speed.
-    max_linear_speed: 0.25       # m/s
-    max_rotational_speed: 0.6    # rad/s
-    max_joint_speed: 1.0         # rad/s per-joint ceiling
+    max_linear_speed: 0.15       # m/s
+    max_rotational_speed: 0.5    # rad/s
+    max_joint_speed: 1.5         # rad/s per-joint ceiling
 
     # ── Selectively-damped solver ──────────────────────────────────────
     # sigma_threshold (σ0): smallest singular value (in unit-weighted space)
@@ -42,7 +42,7 @@ servo_node:
     # Needs python-fcl + trimesh; if absent the servo logs a warning and runs
     # without it. Set collision_check:false to disable entirely.
     collision_check: true
-    collision_mesh_dir: ''          # '' → <pkg share>/meshes/collision_lowpoly
+    collision_mesh_dir: ''          # '' → <pkg share>/meshes/collision
     collision_slow_dist: 0.06       # m: clearance at which damping begins
     collision_stop_dist: 0.02       # m: clearance at which approach is vetoed
                                     #    (also absorbs the decimation under-cut margin)
@@ -70,3 +70,33 @@ servo_node:
     # well-conditioned "ready" pose (σ_min≈0.12); NOTE the arm's all-zeros pose
     # is an exact singularity, so don't seed from zeros.
     initial_positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    # ── Saved poses + go-to-pose planning ──────────────────────────────
+    # save_pose snapshots the current EE pose; go_to_pose re-solves IK (seeded
+    # from the saved joint snapshot) then RRT-plans a collision-free joint path
+    # and streams it through this servo's loop. Library persists to this file.
+    pose_library_path: ''            # '' → ~/.config/robocorea_arm/poses.yaml
+    goto_reach_tol: 0.01             # rad: per-joint waypoint-reached tolerance
+    # Inverse kinematics (damped least squares, seeded from the saved config)
+    ik_pos_tol: 0.002                # m: position convergence
+    ik_ori_tol: 0.02                 # rad: orientation convergence
+    ik_max_iters: 200
+    ik_lambda: 0.05                  # DLS damping
+    # RRT-Connect planner (joint space; self-collision + limits are the validity
+    # check). rrt_seed makes a given query repeatable.
+    rrt_step: 0.10                   # rad: tree extension step
+    rrt_resolution: 0.05             # rad: edge collision-check step
+    rrt_max_time: 5.0                # s: planning budget before giving up
+    rrt_max_nodes: 5000
+    rrt_seed: 0
+    plan_collision_margin: 0.02      # m: clearance the planner keeps (0 = touch only)
+
+    # ── Resolved-pose (analytic-IK) servo mode ─────────────────────────
+    # The arm has a spherical wrist, so a closed-form decoupled IK is available
+    # (arm_ik.py). With ik_servo:true the teleop loop drives joints straight to
+    # the IK solution of the integrated reference pose (exact, no drift), falling
+    # back to the differential SDLS step near singularities / on a branch switch.
+    # Leave false to use the proven SDLS differential servo everywhere.
+    ik_servo: false
+    ik_servo_sigma_min: 0.002        # σ_min (geometric Jacobian) below which → SDLS
+    ik_servo_max_jump: 0.5           # rad: per-tick IK jump above which → SDLS

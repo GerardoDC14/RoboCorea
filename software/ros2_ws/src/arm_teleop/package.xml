@@ -19,10 +19,20 @@
   <exec_depend>control_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
+  <exec_depend>rescue_interfaces</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
   <exec_depend>urdfdom_py</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <!-- Combined robot URDF + chassis/flipper meshes for the digital twin and the
+       arm-vs-body collision checker. -->
+  <exec_depend>arm_description</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <!-- joy is for the optional joystick.launch.py teleop (soft/toggleable). The
+       workstation bring-up that also starts the GUI now lives in the gui package
+       (gui/bringup.launch.py), so arm_teleop no longer depends on gui. -->
+  <exec_depend>joy</exec_depend>
   <!-- Optional, for mesh-on-mesh self-collision avoidance (sdls_servo
        collision_check). pip-only, no rosdep key: `pip install python-fcl trimesh`.
        If absent the servo logs a warning and runs without collision checking. -->

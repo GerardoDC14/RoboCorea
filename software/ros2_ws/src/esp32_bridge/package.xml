@@ -6,7 +6,7 @@
   <description>
     RoboCorea Jetson-side bridge between the ESP32 binary UART protocol and ROS 2
     topics. Runs on the Jetson Orin Nano; relays telemetry/sensor/motor status up
-    and forwards commands (arm joints, e-stop, keybinds, calibration) down.
+    and forwards commands (arm joints, e-stop, PPM calibration) down.
   </description>
   <maintainer email="nabetse069@gmail.com">arepo</maintainer>
   <license>MIT</license>

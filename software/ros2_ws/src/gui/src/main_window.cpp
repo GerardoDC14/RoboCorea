@@ -7,6 +7,7 @@
 #include "gui/digital_twin_panel.hpp"
 #include "gui/filter_registry.hpp"
 #include "gui/app_settings.hpp"
+#include "gui/settings_dialog.hpp"
 #ifdef HAVE_GSTREAMER
 #include "gui/speech_processor.hpp"
 #include "gui/gst_av_stream.hpp"
@@ -61,9 +62,14 @@ MainWindow::MainWindow(rclcpp::Node::SharedPtr node, QWidget* parent)
             dashboard_panel_, &DashboardPanel::setThermalEnabled);
     connect(dashboard_panel_, &DashboardPanel::resetSourcesRequested,
             source_manager_, &SourceManager::discoverSources);
-    connect(dashboard_panel_, &DashboardPanel::settingsRequested, this, [this]() {
-        statusBar()->showMessage("Settings dialog not implemented yet", 3000);
-    });
+    connect(dashboard_panel_, &DashboardPanel::settingsRequested,
+            this, &MainWindow::onSettingsRequested);
+
+    // PPM calibration goes to the ESP32 (via the Jetson bridge). Latched so the
+    // bridge gets the latest calibration even if it joins after the GUI.
+    auto cfg_qos = rclcpp::QoS(1).reliable().transient_local();
+    ppm_calib_pub_ = node_->create_publisher<std_msgs::msg::UInt16MultiArray>(
+        "/robot/ppm_calib", cfg_qos);
 #ifdef HAVE_GSTREAMER
     // Audio-monitor toggle mutes/unmutes the speaker side of every A/V stream.
     connect(dashboard_panel_, &DashboardPanel::audioMonitorToggled, this,
@@ -74,6 +80,9 @@ MainWindow::MainWindow(rclcpp::Node::SharedPtr node, QWidget* parent)
 
     startRosSpinThread();
     source_manager_->discoverSources();
+
+    // Push the persisted PPM calibration once at startup (latched).
+    publishPpmCalib();
 }
 
 MainWindow::~MainWindow()
@@ -174,4 +183,41 @@ void MainWindow::onSourcesUpdated()
     video_panel_->updateSources(
         source_manager_->sourceNames(),
         source_manager_->sourceIdentifiers());
+}
+
+void MainWindow::onSettingsRequested()
+{
+    if (!settings_dialog_) {
+        settings_dialog_ = new SettingsDialog(node_, this);
+        connect(settings_dialog_, &SettingsDialog::settingsApplied,
+                this, &MainWindow::onSettingsApplied);
+    }
+    settings_dialog_->reloadFromSettings();
+    settings_dialog_->show();
+    settings_dialog_->activateWindow();
+    settings_dialog_->raise();
+}
+
+void MainWindow::onSettingsApplied()
+{
+    // Push speech/audio prefs into the live dashboard, then republish the PPM
+    // calibration so the robot picks up calibration edits immediately.
+    dashboard_panel_->applySpeechAudioSettings();
+    publishPpmCalib();
+}
+
+void MainWindow::publishPpmCalib()
+{
+    auto& S = AppSettings::instance();
+    std_msgs::msg::UInt16MultiArray msg;
+    msg.data.resize(18);   // 6 channels × {min, neutral, max}
+    {
+        std::lock_guard<std::mutex> lk(S.ppm_calib_mutex);
+        for (int c = 0; c < 6; ++c) {
+            msg.data[c * 3 + 0] = static_cast<uint16_t>(S.ppm_calib[c].min_us);
+            msg.data[c * 3 + 1] = static_cast<uint16_t>(S.ppm_calib[c].neutral_us);
+            msg.data[c * 3 + 2] = static_cast<uint16_t>(S.ppm_calib[c].max_us);
+        }
+    }
+    ppm_calib_pub_->publish(msg);
 }

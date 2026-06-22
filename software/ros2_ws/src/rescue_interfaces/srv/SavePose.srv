@@ -1,0 +1,8 @@
+# Snapshot the arm's current end-effector pose under a name (overwrites if it
+# exists). The servo stores the EE pose plus the current joint snapshot (used as
+# the IK seed on a later go_to_pose).
+string name
+---
+bool success
+string message
+geometry_msgs/Pose pose      # the captured end-effector pose (base_frame)

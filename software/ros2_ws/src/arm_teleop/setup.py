@@ -18,8 +18,6 @@ setup(
         (os.path.join('share', package_name, 'urdf'), glob('urdf/*')),
         (os.path.join('share', package_name, 'meshes', 'visual'), glob('meshes/visual/*')),
         (os.path.join('share', package_name, 'meshes', 'collision'), glob('meshes/collision/*')),
-        (os.path.join('share', package_name, 'meshes', 'collision_lowpoly'),
-         glob('meshes/collision_lowpoly/*')),
         (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
         (os.path.join('share', package_name, 'scripts'), glob('scripts/*.py')),
     ],
@@ -34,6 +32,7 @@ setup(
             'sdls_servo = arm_teleop.sdls_servo:main',
             'keyboard_servo = arm_teleop.keyboard_servo:main',
             'joystick_servo = arm_teleop.joystick_servo:main',
+            'flipper_state = arm_teleop.flipper_state:main',
         ],
     },
 )

@@ -14,23 +14,11 @@ ArmJoints    Control::s_arm_joints    = {};
 uint8_t      Control::s_sensor_mask   = 0;
 bool         Control::s_hw_estop      = false;
 bool         Control::s_virtual_estop = false;
+bool         Control::s_virtual_flip  = false;
 float        Control::s_deadband      = 0.05f;
 float        Control::s_flip_target[4] = { 0, 0, 0, 0 };
 bool         Control::s_flip_seeded    = false;
 static bool s_bench_neutral_sent       = false;
-
-// Default keybind table (Ch6/slot 4 is the hardware e-stop → always NONE here).
-//   mode0 (Ch5 low):  drive  — Ch2 fwd, Ch4 turn, Ch1 all-flippers
-//   mode1 (Ch5 mid):  flippers individually — Ch1..Ch4 = FL/FR/RL/RR
-//   mode2 (Ch5 high): arm    — Ch1..Ch4 = X/Y/Z/PITCH
-KeybindTable Control::s_keybind = {{
-    {ChannelFunction::FLIPPER_ALL, ChannelFunction::TRACTION_FWD, ChannelFunction::NONE,
-     ChannelFunction::TRACTION_TURN, ChannelFunction::NONE},
-    {ChannelFunction::FLIPPER_FL, ChannelFunction::FLIPPER_FR, ChannelFunction::FLIPPER_RL,
-     ChannelFunction::FLIPPER_RR, ChannelFunction::NONE},
-    {ChannelFunction::ARM_X, ChannelFunction::ARM_Y, ChannelFunction::ARM_Z,
-     ChannelFunction::ARM_PITCH, ChannelFunction::NONE},
-}};
 
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -44,42 +32,78 @@ static inline float clampf(float v, float lo, float hi) {
 }
 
 void Control::begin() {
-    Comms::onArmJoints(   [](const ArmJointsPayload& p) { Control::setArmJoints(p); });
-    Comms::onSensorEnable([](uint8_t mask)              { Control::setSensorMask(mask); });
+    Comms::onArmJoints([](const ArmJointsPayload& p) {
+#if ROBOCOREA_ROLE_IS_ARM
+        Control::setArmJoints(p);
+#else
+        (void)p;
+#endif
+    });
+    Comms::onSensorEnable([](uint8_t mask) {
+#if ROBOCOREA_ROLE_IS_CHASSIS
+        Control::setSensorMask(mask);
+#else
+        (void)mask;
+#endif
+    });
     Comms::onEstop(       [](bool active) {
         if (active) Control::triggerEstop(); else Control::clearEstop();
     });
     Comms::onArmLifecycle([](bool arm) {
+#if ROBOCOREA_ROLE_IS_ARM
         if (arm) CANInterface::requestArm(); else CANInterface::requestDisarm();
+#else
+        (void)arm;
+#endif
     });
     Comms::onArmMode([](uint8_t mode) {
+#if ROBOCOREA_ROLE_IS_ARM
         if (mode <= (uint8_t)ArmOperatingMode::CHASSIS)
             CANInterface::requestOperatingMode((ArmOperatingMode)mode);
+#else
+        (void)mode;
+#endif
     });
-    Comms::onKeybind([](const KeybindPayload& p) { Control::setKeybind(p); });
     Comms::onPpmCalib([](const PpmCalibPayload& p) {
+#if ROBOCOREA_ROLE_IS_CHASSIS
         RC::setCalib(p);
         portENTER_CRITICAL(&s_mux);
         s_deadband = p.deadband_1000 / 1000.0f;
         portEXIT_CRITICAL(&s_mux);
+#else
+        (void)p;
+#endif
     });
 
-#if ARM_BENCH_MODE_NO_PPM
-    s_mode = RobotMode::ARM;
-#else
     s_mode = RobotMode::STANDBY;
-#endif
 }
 
 void Control::tick() {
+#if ROBOCOREA_ROLE_IS_ARM
+    portENTER_CRITICAL(&s_mux);
+    RobotMode current = s_mode;
+    ArmJoints joints = s_arm_joints;
+    portEXIT_CRITICAL(&s_mux);
+
+    if (current == RobotMode::ESTOP) {
+        CANInterface::estopArm();
+        return;
+    }
+    if (joints.valid) CANInterface::sendArmJoints(joints.angle_deg);
+    return;
+#else
     PPMFrame ppm;
     bool have_ppm = RC::getFrame(ppm);
 
-    // ── Ch6 hardware e-stop (highest priority) ──────────────────────────────
+    // ── Ch6-down RC e-stop (highest priority) ───────────────────────────────
+    // Ch6 is a 3-position lever: down third = E-STOP, centre = normal, up third
+    // = virtual-flip. Level-based, like the old hw e-stop: releasing the lever
+    // back to centre resumes (unless a software e-stop is also active).
     if (have_ppm) {
+        float n6 = RC::normalise(PPM_CH_MODE2 - 1, ppm.ch[PPM_CH_MODE2 - 1]);
         portENTER_CRITICAL(&s_mux);
         bool was_hw = s_hw_estop;
-        s_hw_estop = (ppm.ch[PPM_CH_ESTOP - 1] > 1800);
+        s_hw_estop = (n6 <= LEVER_LO_THRESH);
         if (s_hw_estop && !was_hw) {
             s_mode = RobotMode::ESTOP;
             portEXIT_CRITICAL(&s_mux);
@@ -104,19 +128,18 @@ void Control::tick() {
         return;
     }
 
-    // ── Arm-only bench mode: allow keyboard/laptop tests without an RC link. ─
+    // ── Bench mode: relay workstation arm commands without an RC link. ──────
 #if ARM_BENCH_MODE_NO_PPM
     if (!RC::isConnected()) {
-        // Send the unused base/flipper neutral frames once. Re-sending them at
-        // 50 Hz during arm-only bench tests competes with the 6 arm command
-        // frames and can fill the MCP2515's three TX buffers.
+        // Neutralise the base once (re-sending at 50 Hz competes with the 6 arm
+        // command frames and can fill the MCP2515's three TX buffers).
         if (!s_bench_neutral_sent) {
-            Locomotion::neutralise();  // tracks 0, flippers hold/coast per locomotion
+            Locomotion::neutralise();  // tracks 0, flippers hold
             s_bench_neutral_sent = true;
         }
         s_flip_seeded = false;
         portENTER_CRITICAL(&s_mux);
-        s_mode = RobotMode::ARM;
+        s_mode = RobotMode::STANDBY;
         ArmJoints joints = s_arm_joints;
         portEXIT_CRITICAL(&s_mux);
         if (joints.valid) CANInterface::sendArmJoints(joints.angle_deg);
@@ -137,145 +160,123 @@ void Control::tick() {
 
     if (!have_ppm) return;
 
-    int mode_idx = decodeModeIndex(ppm);
-
+    // Fixed control scheme: drive + flippers from the RC every loop.
     portENTER_CRITICAL(&s_mux);
-    KeybindTable kb = s_keybind;
+    if (s_mode != RobotMode::ESTOP) s_mode = RobotMode::NORMAL;
     portEXIT_CRITICAL(&s_mux);
 
-    bool has_arm = false, has_traction = false, has_flipper = false;
-    for (int c = 0; c < 5; ++c) {
-        ChannelFunction fn = kb.map[mode_idx][c];
-        if (isArmFunction(fn))     has_arm = true;
-        if (fn == ChannelFunction::TRACTION_FWD || fn == ChannelFunction::TRACTION_TURN)
-            has_traction = true;
-        if (isFlipperFunction(fn)) has_flipper = true;
-    }
+    applyControl(ppm);
 
-    RobotMode new_mode;
-    if (has_arm && !has_traction && !has_flipper) new_mode = RobotMode::ARM;
-    else if (has_flipper && !has_traction)        new_mode = RobotMode::FLIPPER;
-    else                                          new_mode = RobotMode::NORMAL;
-
+    // Relay the workstation's arm-joint stream. sendArmJoints() ignores it unless
+    // the arm lifecycle is READY (armed), so drive + arm can run concurrently.
     portENTER_CRITICAL(&s_mux);
-    RobotMode old_mode = s_mode;
-    if (s_mode != RobotMode::ESTOP) s_mode = new_mode;
-    // On entering ARM mode, discard any stale buffered joint command so the arm
-    // only follows joint_states received from this point on (no jump to an old
-    // pose). setArmJoints() also drops commands while not in ARM mode.
-    if (s_mode == RobotMode::ARM && old_mode != RobotMode::ARM)
-        s_arm_joints.valid = false;
+    ArmJoints joints = s_arm_joints;
     portEXIT_CRITICAL(&s_mux);
-
-    applyKeybindRow(mode_idx, ppm);
+    if (joints.valid) CANInterface::sendArmJoints(joints.angle_deg);
+#endif
 }
 
-void Control::applyKeybindRow(int mode_idx, const PPMFrame& ppm) {
+void Control::applyControl(const PPMFrame& ppm) {
     constexpr float dt = 1.0f / CONTROL_LOOP_HZ;
 
     portENTER_CRITICAL(&s_mux);
-    KeybindTable kb = s_keybind;
     float kDeadband = s_deadband;
     portEXIT_CRITICAL(&s_mux);
 
-    // Slot → raw PPM channel index: slot 0=Ch1 … 3=Ch4, 4=Ch6.
-    static const int slot_to_ppm[5] = {0, 1, 2, 3, 5};
+    // Calibrated, normalised channel values in [-1,1].
+    auto nrm = [&](int ch1) { return RC::normalise((uint8_t)(ch1 - 1), ppm.ch[ch1 - 1]); };
+    float n_sel  = nrm(PPM_CH_FLIP_SELECT);    // Ch1 flipper L/R selector
+    float n_rate = nrm(PPM_CH_FLIP_RATE);      // Ch2 flipper rate
+    float n_fwd  = nrm(PPM_CH_TRACTION_FWD);   // Ch3 traction forward
+    float n_turn = nrm(PPM_CH_TRACTION_TURN);  // Ch4 traction turn
+    float n_pair = nrm(PPM_CH_FLIP_PAIR);      // Ch5 front/rear pair select
+    float n_mode = nrm(PPM_CH_MODE2);          // Ch6 3-pos lever
 
-    float forward = 0.0f, turn = 0.0f;
-    float flip_all = 0.0f, flip[4] = {0, 0, 0, 0};
-    float gripper_val = 0.0f;
-    bool  has_traction = false, has_flipper = false, has_arm = false, has_gripper = false;
+    // Ch6 up third = virtual flip ("drive from the other end"). Publish for the GUI.
+    bool vflip = (n_mode >= LEVER_HI_THRESH);
+    portENTER_CRITICAL(&s_mux);
+    s_virtual_flip = vflip;
+    portEXIT_CRITICAL(&s_mux);
 
-    for (int c = 0; c < 5; ++c) {
-        ChannelFunction fn = kb.map[mode_idx][c];
-        if (fn == ChannelFunction::NONE) continue;
-        int ppm_idx = slot_to_ppm[c];
-        float val = RC::normalise((uint8_t)ppm_idx, ppm.ch[ppm_idx]);
-        if (fabsf(val) < kDeadband) val = 0.0f;
+    // Deadband the analog sticks (Ch1 keeps its raw value — it's a 3-way selector).
+    if (fabsf(n_rate) < kDeadband) n_rate = 0.0f;
+    if (fabsf(n_fwd)  < kDeadband) n_fwd  = 0.0f;
+    if (fabsf(n_turn) < kDeadband) n_turn = 0.0f;
 
-        switch (fn) {
-            case ChannelFunction::TRACTION_FWD:  forward = val; has_traction = true; break;
-            case ChannelFunction::TRACTION_TURN: turn = val;    has_traction = true; break;
-            case ChannelFunction::FLIPPER_ALL:   flip_all = val; has_flipper = true; break;
-            case ChannelFunction::FLIPPER_FL:    flip[0] = val;  has_flipper = true; break;
-            case ChannelFunction::FLIPPER_FR:    flip[1] = val;  has_flipper = true; break;
-            case ChannelFunction::FLIPPER_RL:    flip[2] = val;  has_flipper = true; break;
-            case ChannelFunction::FLIPPER_RR:    flip[3] = val;  has_flipper = true; break;
-            case ChannelFunction::GRIPPER:       gripper_val = val; has_gripper = true; has_arm = true; break;
-            default:
-                if (isArmFunction(fn)) has_arm = true;
-                break;
-        }
-    }
+    // ── Traction (Ch3 forward, Ch4 turn) ────────────────────────────────────
+    float fwd = n_fwd, turn = n_turn;
+#if VFLIP_INVERT_FORWARD
+    if (vflip) fwd = -fwd;
+#endif
+#if VFLIP_INVERT_TURN
+    if (vflip) turn = -turn;
+#endif
+    Locomotion::setDriveCommand(fwd, turn);
 
-    // ── Traction ────────────────────────────────────────────────────────────
-    if (has_traction) {
-        Locomotion::setDriveCommand(forward, turn);
-    } else if (!has_arm) {
-        Locomotion::setTrackSpeeds(0.0f, 0.0f);
-    }
+    // ── Flipper selection: Ch5 picks the pair, Ch1 picks left / right / both ─
+    // Pair indices into s_flip_target[] (FL=0, FR=1, RL=2, RR=3). Ch5 min → FRONT.
+    bool front_pair = (n_pair < 0.0f);
+#if VFLIP_SWAP_PAIR
+    if (vflip) front_pair = !front_pair;       // flipped: Ch5 "front" → physical rear
+#endif
+    int leftIdx  = front_pair ? 0 : 2;         // FL or RL
+    int rightIdx = front_pair ? 1 : 3;         // FR or RR
+#if VFLIP_SWAP_LEFTRIGHT
+    if (vflip) { int t = leftIdx; leftIdx = rightIdx; rightIdx = t; }  // op-left = robot-right
+#endif
 
-    // ── Flippers (integrate stick → target angle; loop closed on the VESC) ───
-    // Stick deflection = rate: the target moves while deflected and HOLDS where
-    // released. The VESC lisp closes the position loop and reports the angle.
+    // Ch1: below −deadband → left only, above +deadband → right only, else both.
+    bool drive_left, drive_right;
+    if (n_sel < -kDeadband)      { drive_left = true;  drive_right = false; }
+    else if (n_sel >  kDeadband) { drive_left = false; drive_right = true;  }
+    else                         { drive_left = true;  drive_right = true;  }
+
+    float rate_cmd = n_rate;
+#if VFLIP_INVERT_FLIP_RATE
+    if (vflip) rate_cmd = -rate_cmd;
+#endif
+
+    // ── Integrate the selected flippers' targets (loop closed on the VESC) ──
+    // Stick deflection = rate; the per-flipper target integrates it and HOLDS
+    // where released (rate 0 → candidate == target). FLIPPER_DIR_* applies the
+    // physical orientation sign. Unselected flippers get rate 0 → they hold.
     static const float kFlipDir[4] = { FLIPPER_DIR_FL, FLIPPER_DIR_FR,
                                        FLIPPER_DIR_RL, FLIPPER_DIR_RR };
-    if (has_flipper) {
-        // Bumpless transfer: on (re)entering flipper control, seed targets from
-        // the measured angle so the flippers don't jump to a stale setpoint.
-        if (!s_flip_seeded) {
-            float measured[4];
-            CANInterface::getFlipperAngles(measured);
-            for (int i = 0; i < 4; i++) s_flip_target[i] = measured[i];
-            s_flip_seeded = true;
-        }
+    float norms[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (drive_left)  norms[leftIdx]  = rate_cmd;
+    if (drive_right) norms[rightIdx] = rate_cmd;
 
-        float norms[4];
-        if (flip_all != 0.0f) { norms[0] = norms[1] = norms[2] = norms[3] = flip_all; }
-        else                  { for (int i = 0; i < 4; i++) norms[i] = flip[i]; }
-
-        // Integrate each stick into a candidate target first; commit afterwards
-        // so the collision clamp sees this cycle's intent for every flipper.
-        float candidate[4];
-        for (int i = 0; i < 4; i++) {
-            float delta = norms[i] * kFlipDir[i] * FLIPPER_RATE_DPS * dt;
-#if FLIPPER_SOFT_LIMIT_ENABLE
-            candidate[i] = clampf(s_flip_target[i] + delta,
-                                  FLIPPER_ANGLE_MIN, FLIPPER_ANGLE_MAX);
-#else
-            candidate[i] = wrap360f(s_flip_target[i] + delta);
-#endif
-        }
-
-#if FLIPPER_COLLISION_AVOID_ENABLE
-        // Dynamic joint limits: refuse any step that would close a front/rear
-        // pair to within FLIPPER_COLLISION_MARGIN_M, measured against the paired
-        // flipper's actual reported angle (see FlipperCollision.h).
+#if !FLIPPER_USE_LEGACY_RPM_LISP
+    // Custom-frame path only: seed the targets from the VESC-measured angle once
+    // (bumpless). The fake-RPM lisp path free-runs the accumulator (no seeding).
+    if (!s_flip_seeded) {
         float measured[4];
         CANInterface::getFlipperAngles(measured);
-        for (int i = 0; i < 4; i++)
-            candidate[i] = FlipperCollision::clampTarget(i, candidate[i],
-                                                         s_flip_target[i], measured);
+        for (int i = 0; i < 4; i++) s_flip_target[i] = measured[i];
+        s_flip_seeded = true;
+    }
 #endif
 
-        for (int i = 0; i < 4; i++) s_flip_target[i] = candidate[i];
-        Locomotion::setFlipperAngles(s_flip_target, /*enabled=*/true);
-    } else {
-        // No flipper bound in this row → HOLD the last target (keep the loop
-        // closed on the VESC); re-seed next time flippers are actively bound.
-        s_flip_seeded = false;
-        Locomotion::setFlipperAngles(s_flip_target, /*enabled=*/true);
+    float candidate[4];
+    for (int i = 0; i < 4; i++) {
+        float next = s_flip_target[i] + norms[i] * kFlipDir[i] * FLIPPER_RATE_DPS * dt;
+#if FLIPPER_SOFT_LIMIT_ENABLE
+        next = clampf(next, FLIPPER_ANGLE_MIN, FLIPPER_ANGLE_MAX);
+#elif !FLIPPER_USE_LEGACY_RPM_LISP
+        next = wrap360f(next);   // custom-frame target wraps; legacy lisp wants continuous
+#endif
+        candidate[i] = next;
     }
 
-    // ── Arm (commanded from the PC; tracks stopped for safety) ──────────────
-    if (has_arm) {
-        Locomotion::setTrackSpeeds(0.0f, 0.0f);
-        portENTER_CRITICAL(&s_mux);
-        ArmJoints joints = s_arm_joints;
-        portEXIT_CRITICAL(&s_mux);
-        if (joints.valid) CANInterface::sendArmJoints(joints.angle_deg);
-        if (has_gripper)  Comms::sendGripper(gripper_val);
-    }
+#if FLIPPER_COLLISION_ENABLE
+    // Dynamic joint limits: a front/rear pair on a side may not both sit in their
+    // danger arcs at once. Left = FL,RL  Right = FR,RR.
+    FlipperCollision::applySide(0, 2, s_flip_target, candidate);  // left
+    FlipperCollision::applySide(1, 3, s_flip_target, candidate);  // right
+#endif
+
+    for (int i = 0; i < 4; i++) s_flip_target[i] = candidate[i];
+    Locomotion::setFlipperAngles(s_flip_target, /*enabled=*/true);
 }
 
 void Control::triggerEstop() {
@@ -284,7 +285,9 @@ void Control::triggerEstop() {
     s_mode = RobotMode::ESTOP;
     s_flip_seeded = false;          // re-seed flippers on resume
     portEXIT_CRITICAL(&s_mux);
+#if ROBOCOREA_ROLE_IS_CHASSIS
     Locomotion::estopOutputs();
+#endif
     CANInterface::estopArm();
 }
 
@@ -298,28 +301,30 @@ void Control::clearEstop() {
 }
 
 void Control::setArmJoints(const ArmJointsPayload& payload) {
+#if ROBOCOREA_ROLE_IS_ARM
     portENTER_CRITICAL(&s_mux);
-    // Only capture joint commands while in ARM mode; otherwise drop them.
-    if (s_mode == RobotMode::ARM) {
+    // Capture the workstation's joint stream whenever we're not e-stopped (the
+    // RC no longer has a dedicated arm mode; the arm lifecycle gate in
+    // CANInterface::sendArmJoints() decides whether it actually moves).
+    if (s_mode != RobotMode::ESTOP) {
         for (int i = 0; i < 6; i++) s_arm_joints.angle_deg[i] = payload.joint[i] * 0.01f;
         s_arm_joints.valid = true;
     }
     portEXIT_CRITICAL(&s_mux);
+#else
+    (void)payload;
+#endif
 }
 
 void Control::setSensorMask(uint8_t mask) {
+#if ROBOCOREA_ROLE_IS_CHASSIS
     portENTER_CRITICAL(&s_mux);
     s_sensor_mask = mask;
     portEXIT_CRITICAL(&s_mux);
     Sensors::setEnabledMask(mask);
-}
-
-void Control::setKeybind(const KeybindPayload& payload) {
-    portENTER_CRITICAL(&s_mux);
-    for (int m = 0; m < 3; ++m)
-        for (int c = 0; c < 5; ++c)
-            s_keybind.map[m][c] = (ChannelFunction)payload.map[m][c];
-    portEXIT_CRITICAL(&s_mux);
+#else
+    (void)mask;
+#endif
 }
 
 RobotMode Control::getMode() {
@@ -331,21 +336,13 @@ RobotMode Control::getMode() {
 
 void Control::getSystemStatus(SystemStatus& out) {
     portENTER_CRITICAL(&s_mux);
-    out.mode        = s_mode;
-    out.sensor_mask = s_sensor_mask;
-    out.estop       = (s_mode == RobotMode::ESTOP);
+    out.mode         = s_mode;
+    out.sensor_mask  = s_sensor_mask;
+    out.estop        = (s_mode == RobotMode::ESTOP);
+    out.virtual_flip = s_virtual_flip;
     portEXIT_CRITICAL(&s_mux);
     out.ppm_connected    = RC::isConnected();
     out.minipc_connected = Comms::isConnected();
     out.can_ok           = CANInterface::isOk();
     out.uptime_ms        = millis();
-}
-
-int Control::decodeModeIndex(const PPMFrame& ppm) {
-    constexpr uint16_t kLow  = PPM_MIN_US + (PPM_MAX_US - PPM_MIN_US) / 4;  // ~1250
-    constexpr uint16_t kHigh = PPM_MAX_US - (PPM_MAX_US - PPM_MIN_US) / 4;  // ~1750
-    uint16_t ch5 = ppm.ch[PPM_CH_MODE - 1];
-    if (ch5 < kLow)  return 0;
-    if (ch5 > kHigh) return 2;
-    return 1;
 }

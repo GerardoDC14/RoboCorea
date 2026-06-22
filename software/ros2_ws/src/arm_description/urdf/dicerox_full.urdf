@@ -1,0 +1,382 @@
+<?xml version="1.0"?>
+<!--
+  dicerox_full.urdf — the WHOLE robot in one model: the 6-DOF arm + the tracked
+  chassis + the four articulated flippers. Hand-merged (plain URDF, no xacro) so
+  launch files can read it as a string, mirroring the legacy
+  dicerox_moveit/Dicerox_robot_arm_URDF.urdf.xacro recipe:
+
+    * the arm (world_link -> base_link -> Link1..Link6) is reproduced verbatim
+      from arm_teleop/urdf/dicerox_arm.urdf; arm link meshes stay in arm_teleop
+      and are referenced by package://arm_teleop URIs.
+    * the chassis (chassis_base_link + Flipper1L..Flipper4L) comes from the
+      legacy dicerox_urdf_v1; its meshes live in package://arm_description.
+    * the chassis is bolted under the arm's world_link by world_link_to_
+      chassis_base_link, at the same offset the legacy MoveIt model used.
+
+  Consumers:
+    * robot_state_publisher -> /robot_description -> the GUI digital twin and
+      RViz render the full robot. The twin/RViz use the meshes/visual STLs.
+    * arm_teleop/sdls_servo reads this same URDF for kinematics AND for the
+      base-frame transforms of the chassis + flippers used by body_collision
+      (which uses the lighter meshes/collision proxies instead).
+
+  Joint name map (drives /joint_states):
+    arm      : Joint1..Joint6     (published by servo_node)
+    flippers : Flipper1J..Flipper4J (published by arm_teleop flipper_state from
+               /encoders/flipper, order [fl, fr, rl, rr] -> [1, 2, 3, 4])
+-->
+<robot name="dicerox_full">
+
+  <link name="world_link" />
+
+  <!-- ===================== ARM (from arm_teleop) ====================== -->
+  <!-- Rotate the CAD-exported base so the robot stands upright in RViz/MoveIt. -->
+  <joint name="world_link_to_base_link" type="fixed">
+    <origin xyz="0 0 0" rpy="3.141592653589793 0 0" />
+    <parent link="world_link" />
+    <child link="base_link" />
+  </joint>
+
+  <link name="base_link">
+    <inertial>
+      <origin xyz="-9.49825873871185E-05 -1.04297722111363E-06 0.0144742771636322" rpy="0 0 0" />
+      <mass value="0.616927576087879" />
+      <inertia ixx="0.00235120961653514" ixy="1.48592051070372E-08" ixz="1.72093144714663E-07" iyy="0.000752293306588767" iyz="8.93709469162573E-10" izz="0.0030503193907466" />
+    </inertial>
+    <!-- Visual/collision intentionally omitted: chassis_base_link below carries
+         the body mesh; a mesh here would double-draw the body. -->
+  </link>
+  <link name="Link1">
+    <inertial>
+      <origin xyz="-1.5987E-06 0.024748 -0.061373" rpy="0 0 0" />
+      <mass value="0.40272" />
+      <inertia ixx="0.00020115" ixy="8.9742E-10" ixz="1.4855E-08" iyy="0.00029101" iyz="5.2612E-06" izz="0.00020797" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_teleop/meshes/visual/Link1.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_teleop/meshes/collision/Link1.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Joint1" type="revolute">
+    <origin xyz="0 0 -0.02135" rpy="0 0 0" />
+    <parent link="base_link" />
+    <child link="Link1" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.5708" upper="1.5708" effort="1000" velocity="1000" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Link2">
+    <inertial>
+      <origin xyz="-0.243045429859638 -0.0135631154060198 0.0109133250229265" rpy="0 0 0" />
+      <mass value="0.850434760512325" />
+      <inertia ixx="0.000566538415993394" ixy="-0.000197628674376634" ixz="5.15412905692302E-05" iyy="0.00151204564961416" iyz="-2.74040675259699E-05" izz="0.0016954901326145" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_teleop/meshes/visual/Link2.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_teleop/meshes/collision/Link2.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Joint2" type="revolute">
+    <origin xyz="0 0 -0.085" rpy="-1.5708 -0.0523599 0" />
+    <parent link="Link1" />
+    <child link="Link2" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.14159" upper="0" effort="1000" velocity="1000" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Link3">
+    <inertial>
+      <origin xyz="0.144477857773968 0.0250963518852683 -0.00383266973549601" rpy="0 0 0" />
+      <mass value="0.583243866421534" />
+      <inertia ixx="0.000369010255911609" ixy="-7.60066997552285E-05" ixz="-5.44971341604371E-05" iyy="0.000787611709577075" iyz="-9.53787377811168E-06" izz="0.000837010731417748" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_teleop/meshes/visual/Link3.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_teleop/meshes/collision/Link3.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Joint3" type="revolute">
+    <origin xyz="-0.37445 0.024154 0" rpy="0 0 -0.064417" />
+    <parent link="Link2" />
+    <child link="Link3" />
+    <axis xyz="0 0 1" />
+    <limit lower="0" upper="3.49066" effort="1000" velocity="1000" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Link4">
+    <inertial>
+      <origin xyz="0.0017238 0.0060777 -0.34018" rpy="0 0 0" />
+      <mass value="0.1006" />
+      <inertia ixx="3.1596E-05" ixy="-1.2772E-07" ixz="3.2611E-07" iyy="4.0916E-05" iyz="3.9956E-06" izz="2.3493E-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_teleop/meshes/visual/Link4.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_teleop/meshes/collision/Link4.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Joint4" type="revolute">
+    <origin xyz="0 0 0" rpy="-1.5708 0 1.7395" />
+    <parent link="Link3" />
+    <child link="Link4" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-1.5708" upper="1.5708" effort="1000" velocity="1000" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Link5">
+    <inertial>
+      <origin xyz="0.0016612 -0.035686 0.0044302" rpy="0 0 0" />
+      <mass value="0.1131" />
+      <inertia ixx="4.1087E-05" ixy="-6.719E-10" ixz="2.8114E-08" iyy="4.0687E-05" iyz="-7.1084E-06" izz="3.4714E-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_teleop/meshes/visual/Link5.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_teleop/meshes/collision/Link5.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Joint5" type="revolute">
+    <origin xyz="0 0 -0.345" rpy="1.5708 0 0" />
+    <parent link="Link4" />
+    <child link="Link5" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.5708" upper="1.5708" effort="1000" velocity="1000" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Link6">
+    <inertial>
+      <origin xyz="0.00035634 2.3759E-05 0.066312" rpy="0 0 0" />
+      <mass value="0.25036" />
+      <inertia ixx="0.0001021" ixy="-3.1303E-08" ixz="1.6229E-07" iyy="9.1239E-05" iyz="5.6802E-07" izz="5.7902E-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_teleop/meshes/visual/Link6.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.75294 0.75294 0.75294 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_teleop/meshes/collision/Link6.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Joint6" type="revolute">
+    <origin xyz="0 -0.189 0" rpy="-1.5708 0 0" />
+    <parent link="Link5" />
+    <child link="Link6" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-1.5708" upper="1.5708" effort="1000" velocity="1000" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+
+  <!-- ============== CHASSIS + FLIPPERS (from dicerox_urdf_v1) ========== -->
+  <!-- Bolt the chassis under the arm so both share one model in the twin / -->
+  <!-- collision world. Same offset as the legacy dicerox_moveit merge.     -->
+  <joint name="world_link_to_chassis_base_link" type="fixed">
+    <origin xyz="-0.14 0 -0.14" rpy="0 0 -1.5708" />
+    <parent link="world_link" />
+    <child link="chassis_base_link" />
+  </joint>
+
+  <link name="chassis_base_link">
+    <inertial>
+      <origin xyz="-6.0962E-06 -0.0098619 0.019556" rpy="0 0 0" />
+      <mass value="23.384" />
+      <inertia ixx="0.45314" ixy="-3.9592E-07" ixz="6.5591E-07" iyy="0.092646" iyz="2.3142E-05" izz="0.4283" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_description/meshes/visual/base_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.89804 0.91765 0.92941 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_description/meshes/collision/base_link.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Flipper1L">
+    <inertial>
+      <origin xyz="-0.038777 0.11447 4.8819E-06" rpy="0 0 0" />
+      <mass value="2.2681" />
+      <inertia ixx="0.030289" ixy="5.4004E-06" ixz="-3.6002E-09" iyy="0.0072507" iyz="5.3367E-07" izz="0.025427" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_description/meshes/visual/Flipper1L.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.75294 0.75294 0.75294 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_description/meshes/collision/Flipper1L.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Flipper1J" type="revolute">
+    <origin xyz="-0.37013 0.265 0" rpy="3.1416 0 3.1416" />
+    <parent link="chassis_base_link" />
+    <child link="Flipper1L" />
+    <axis xyz="-1 0 0" />
+    <limit lower="-3.1416" upper="3.1416" effort="1000" velocity="1.5" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Flipper2L">
+    <inertial>
+      <origin xyz="0.038777 0.11447 -4.8819E-06" rpy="0 0 0" />
+      <mass value="2.2681" />
+      <inertia ixx="0.030289" ixy="-5.4004E-06" ixz="-3.6002E-09" iyy="0.0072507" iyz="-5.3367E-07" izz="0.025427" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_description/meshes/visual/Flipper2L.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.75294 0.75294 0.75294 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_description/meshes/collision/Flipper2L.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Flipper2J" type="revolute">
+    <origin xyz="0.37013 0.265 0" rpy="3.1416 0 3.1416" />
+    <parent link="chassis_base_link" />
+    <child link="Flipper2L" />
+    <axis xyz="-1 0 0" />
+    <limit lower="-3.1416" upper="3.1416" effort="1000" velocity="1.5" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Flipper3L">
+    <inertial>
+      <origin xyz="-0.038777 0.11447 4.8819E-06" rpy="0 0 0" />
+      <mass value="2.2681" />
+      <inertia ixx="0.030289" ixy="5.4004E-06" ixz="-3.6002E-09" iyy="0.0072507" iyz="5.3367E-07" izz="0.025427" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_description/meshes/visual/Flipper3L.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.75294 0.75294 0.75294 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_description/meshes/collision/Flipper3L.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Flipper3J" type="revolute">
+    <origin xyz="-0.37013 -0.265 0" rpy="3.1416 0 3.1416" />
+    <parent link="chassis_base_link" />
+    <child link="Flipper3L" />
+    <axis xyz="-1 0 0" />
+    <limit lower="-3.1416" upper="3.1416" effort="1000" velocity="1.5" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+  <link name="Flipper4L">
+    <inertial>
+      <origin xyz="0.038777 0.11447 -4.8819E-06" rpy="0 0 0" />
+      <mass value="2.2681" />
+      <inertia ixx="0.030289" ixy="-5.4004E-06" ixz="-3.6002E-09" iyy="0.0072507" iyz="-5.3367E-07" izz="0.025427" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_description/meshes/visual/Flipper4L.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.75294 0.75294 0.75294 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://arm_description/meshes/collision/Flipper4L.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="Flipper4J" type="revolute">
+    <origin xyz="0.37013 -0.265 0" rpy="3.1416 0 -3.1416" />
+    <parent link="chassis_base_link" />
+    <child link="Flipper4L" />
+    <axis xyz="-1 0 0" />
+    <limit lower="-3.1416" upper="3.1416" effort="1000" velocity="1.5" />
+    <dynamics damping="0.1" friction="0.1" />
+  </joint>
+
+</robot>

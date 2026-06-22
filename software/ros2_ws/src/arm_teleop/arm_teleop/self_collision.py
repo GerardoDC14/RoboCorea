@@ -42,7 +42,7 @@ class SelfCollision:
         Provides ``link_poses(q)`` (world transforms keyed by link name) and the
         joint limits used to sample the ACM.
     mesh_dir : str
-        Directory holding ``<LinkName>.STL`` low-poly collision proxies.
+        Directory holding ``<LinkName>.stl`` low-poly collision proxies.
     link_names : list[str]
         Candidate links to check (those without a mesh file are skipped, e.g.
         ``base_link``).
@@ -67,7 +67,7 @@ class SelfCollision:
         self._log = logger or (lambda _m: None)
         self.near_band = float(near_band)
         self.links = [ln for ln in link_names
-                      if os.path.exists(os.path.join(mesh_dir, ln + '.STL'))]
+                      if os.path.exists(os.path.join(mesh_dir, ln + '.stl'))]
         if len(self.links) < 2:
             raise FileNotFoundError(
                 f'need >=2 link meshes in {mesh_dir}; found {self.links}')
@@ -76,7 +76,7 @@ class SelfCollision:
         self._corners = {}      # 8 local AABB corners per link, for broadphase
         for ln in self.links:
             self._objs[ln], self._corners[ln] = self._load(
-                os.path.join(mesh_dir, ln + '.STL'))
+                os.path.join(mesh_dir, ln + '.stl'))
         self._dreq = fcl.DistanceRequest()
         self._creq = fcl.CollisionRequest()
 
@@ -158,6 +158,20 @@ class SelfCollision:
         """Smallest clearance over near pairs (m); inf if all beyond near_band."""
         d = self.distances(q)
         return min(d.values()) if d else float('inf')
+
+    def in_collision(self, q, margin=0.0):
+        """Boolean self-collision predicate for the path planner.
+
+        ``margin == 0``: True only if some checkable pair is actually touching
+        (a fast collide query over every pair). ``margin > 0``: True if any pair's
+        clearance is below ``margin`` (a safety buffer, via the broadphase-gated
+        distance query). Adjacent / always-touching / unreachable pairs are
+        already excluded from ``self.pairs`` by the ACM, so they never trip this.
+        """
+        if margin > 0.0:
+            return self.min_clearance(q) < margin
+        self._place_all(q)
+        return any(self._in_contact(a, b) for a, b in self.pairs)
 
     def _in_contact(self, a, b):
         res = fcl.CollisionResult()

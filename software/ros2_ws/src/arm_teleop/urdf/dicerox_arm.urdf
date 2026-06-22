@@ -37,7 +37,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://arm_teleop/meshes/collision/Link1.STL" />
+        <mesh filename="package://arm_teleop/meshes/collision/Link1.stl" />
       </geometry>
     </collision>
   </link>
@@ -67,7 +67,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://arm_teleop/meshes/collision/Link2.STL" />
+        <mesh filename="package://arm_teleop/meshes/collision/Link2.stl" />
       </geometry>
     </collision>
   </link>
@@ -97,7 +97,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://arm_teleop/meshes/collision/Link3.STL" />
+        <mesh filename="package://arm_teleop/meshes/collision/Link3.stl" />
       </geometry>
     </collision>
   </link>
@@ -127,7 +127,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://arm_teleop/meshes/collision/Link4.STL" />
+        <mesh filename="package://arm_teleop/meshes/collision/Link4.stl" />
       </geometry>
     </collision>
   </link>
@@ -157,7 +157,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://arm_teleop/meshes/collision/Link5.STL" />
+        <mesh filename="package://arm_teleop/meshes/collision/Link5.stl" />
       </geometry>
     </collision>
   </link>
@@ -187,7 +187,7 @@
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="package://arm_teleop/meshes/collision/Link6.STL" />
+        <mesh filename="package://arm_teleop/meshes/collision/Link6.stl" />
       </geometry>
     </collision>
   </link>

@@ -15,7 +15,9 @@ package (see `reference/architecture.md` §11.1), built in compiling increments.
 | Odometry (mode/flags, traction, track wheel-odometry, flippers, VESC table, arm telemetry) | **implemented** |
 | Digital twin (URDF/OpenGL, posed from `/joint_states`) | **implemented** |
 | CV filters (Hazmat YOLO, QR/barcode, shape detect) | **implemented** |
-| Settings / Keybind / PPM-calib dialogs | TODO |
+| Settings / PPM-calib dialogs (no keybind editor — fixed RC scheme) | **implemented** |
+| Arm lifecycle controls (arm/disarm, dexterity/chassis, CAN presence) in the dashboard | **implemented** |
+| Workstation `bringup.launch.py` (GUI + servo + flipper_state + twin) | **implemented** |
 
 GStreamer is **optional at build time**: without its dev packages the GUI still
 builds, just without the C920 A/V stream + its audio. The CV filters and digital
@@ -90,7 +92,10 @@ round-trip for video** (the legacy `gst_bridge` is gone).
 
 `host: ""` → use `default_robot_host` (set this to your Jetson's IP). `audio: true`
 makes the stream a native A/V receiver (front cam). Ports must match the robot
-streamer. (Created with defaults on first run; an in-app settings dialog is TODO.)
+streamer. The file is created with defaults on first run and edited live by the
+in-app **Settings** dialog (the ⚙ button in the dashboard), which also persists
+the `ppm_calib` array (pushed to the robot on `/robot/ppm_calib`). There is no
+keybind editor — the RC control scheme is fixed in the firmware.
 
 ---
 

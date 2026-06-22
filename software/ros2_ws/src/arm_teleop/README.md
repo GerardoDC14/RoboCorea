@@ -12,8 +12,20 @@ legacy isotropic DLS (`reference/.../damped_servo.py`) misbehave.
 | MoveIt Servo | scales the whole twist + **hard-stops** at threshold | the arm **freezes** mid-motion; hysteresis ping-pongs at the boundary |
 | **SDLS (this)** | damps **each singular direction by its own σ** | 5 healthy axes track exactly, only the collapsing DOF is bounded; never halts, never explodes |
 
-The dicerox arm is a **non-spherical 6R** (J4→J5 = 0.345 m, J5→J6 = 0.189 m), so
-there is no closed-form IK — numerical differential IK is the only option.
+The dicerox arm **does have a spherical wrist** — the J4/J5/J6 axes intersect at
+a common point (verified: 0 mm residual at every configuration), and the wrist is
+a clean proper-Euler **ZYZ** triplet with the wrist centre 0.189 m back along the
+tool axis. So a closed-form, kinematically-decoupled IK *is* available
+(`arm_ik.py`: closed-form ZYZ orientation + a 3-DOF wrist-centre position solve;
+the ~3° frame tilts on J2/J3 are why the position half isn't pure closed form).
+The earlier "non-spherical" note was wrong — it inferred non-intersection from the
+large J4→J5 = 0.345 m / J5→J6 = 0.189 m link offsets, but those are *along* the
+wrist axes, not perpendicular, so the axes still concur.
+
+A **differential** servo is still the core for real-time teleop (continuous,
+singularity-robust, no solution-branch flips); the analytic solver is used for
+go-to-pose goals and is available as an opt-in resolved-pose servo mode (with the
+differential SDLS step as the singularity/limit fallback) — see below.
 
 ## The solver (`sdls_servo.py`)
 
@@ -53,8 +65,9 @@ How it works:
 - **Geometry:** one **low-poly** FCL `BVHModel` per link. The full-res CAD
   collision STLs (Link6 ≈ 118k triangles) are ~20–30× too heavy for a 100 Hz
   query — a single separated `Link6` distance query is ~4.4 ms raw vs ~0.16 ms
-  decimated. `scripts/make_collision_meshes.py` decimates `meshes/collision/` →
-  `meshes/collision_lowpoly/` (≈6% of the triangles), committed to the repo.
+  decimated. `scripts/make_collision_meshes.py` decimates `meshes/collision_src/`
+  → `meshes/collision/` (lowercase `.stl`, ≈6% of the triangles), committed to
+  the repo.
 - **ACM:** an allowed-collision matrix is learned once at startup by sampling
   random valid configs — adjacent links (always touching at their joint) and
   unreachable pairs are dropped, leaving only the pairs that can actually clash
@@ -77,6 +90,107 @@ python3 src/arm_teleop/scripts/make_collision_meshes.py --target 1200
 Runtime needs `python-fcl` + `trimesh` on the workstation (`pip install
 python-fcl trimesh`). Set `collision_check: false` to disable.
 
+## Body collision — chassis + flippers (`body_collision.py`)
+
+The servo also avoids the **robot body**: the tracked chassis and the four
+articulated flippers, not just the arm's own links. Same FCL look-ahead damper
+(and the same `is_valid` gate for RRT planning), with the obstacle set read from
+the **combined URDF** (`arm_description/urdf/dicerox_full.urdf`):
+
+- the **chassis** is one fixed low-poly mesh, posed in the arm `base_link` frame
+  straight from the URDF mount (no hard-coded offsets);
+- each **flipper** is a mesh whose pose is driven **live from `/encoders/flipper`**
+  — the servo reads the flipper joint angles back off `/joint_states` (the same
+  URDF-convention radians the `flipper_state` bridge publishes, so the collision
+  flippers match the digital twin exactly), so **raising a flipper actually
+  blocks the arm**.
+- an ACM (sampling arm configs × flipper angles) drops pairs that are always in
+  contact — e.g. the arm mount resting on the chassis deck — so they never
+  permanently veto motion.
+
+Low-poly body proxies live in `arm_description/meshes/collision/`
+(`scripts/make_body_collision.py` there decimates the chassis to ~5k tris and
+drops the ~2900 bolt components; flippers to ~700). On by default; needs the
+combined URDF (with the arm-only URDF it disables itself cleanly). Tunables:
+`body_collision`, `body_collision_slow_dist` / `_stop_dist`,
+`body_collision_acm_samples`, `flipper_sample_deg`.
+
+## Full-robot digital twin & bring-up
+
+The digital twin (GUI panel / RViz) renders the **whole** robot — arm + chassis +
+flippers — from the combined URDF on `/robot_description` and `/joint_states`.
+Two publishers feed `/joint_states` and the consumers merge per-joint:
+
+- `servo_node` → the 6 **arm** joints (`Joint1..Joint6`);
+- `flipper_state` → the 4 **flipper** joints (`Flipper1J..Flipper4J`), converting
+  `/encoders/flipper` (deg, `[fl, fr, rl, rr]`) to radians. Encoder convention
+  (zero offset, sign, 0..360 wrap) is bench-tunable via its `angle_offsets_deg`,
+  `joint_signs`, `wrap_pm180` params.
+
+The **gui** package's `bringup.launch.py` starts all of it in one shot on the
+workstation — robot_state_publisher (combined URDF), the servo (self- **and**
+body-collision), `flipper_state`, and the operator GUI (the operator console owns
+the bring-up, so it lives in `gui`, not here):
+
+```bash
+ros2 launch gui bringup.launch.py                 # GUI + twin + servo
+ros2 launch gui bringup.launch.py joystick:=true  # + gamepad teleop
+ros2 launch gui bringup.launch.py use_gui:=false use_rviz:=true
+```
+
+It does **not** start `esp32_bridge` (that runs on the Jetson); on the
+workstation `/encoders/flipper` and friends arrive over DDS from the robot. With
+no bridge running the flippers just stay level and the arm still jogs/plans.
+
+## Saved poses + go-to-pose (RRT planning)
+
+The servo can **store named end-effector poses** and **return to them** with a
+collision-free, RRT-planned joint motion — driven from the GUI's digital-twin
+panel or from the CLI/RViz via services (so it works in the `twin.launch.py`
+flow too). The pose library is server-side (`pose_library_path`, default
+`~/.config/robocorea_arm/poses.yaml`), so the GUI and CLI share one source.
+
+How a *go* works: re-solve IK for the saved EE pose (seeded from the saved joint
+snapshot, so a 6R arm's multiple solutions resolve to the intended branch) →
+`arm_planner.plan_rrt` finds a collision-free joint path (self-collision + limits
+as the validity check, the **same** FCL checker used at runtime) → shortcut
+smoothing → the loop streams the path into `/joint_states`. A **non-zero stick /
+twist instantly aborts** an in-progress move (operator override), as does a fault
+or `pause_servo`. Planning runs on a worker thread (MultiThreadedExecutor) so the
+100 Hz `/joint_states` output never stalls.
+
+Services on `servo_node` (`rescue_interfaces/srv/*`):
+
+| Service | Action |
+|---|---|
+| `~/save_pose {name}` | snapshot the current EE pose under `name` |
+| `~/go_to_pose {name}` *(or `{use_pose: true, pose: …}`)* | plan + move to it |
+| `~/delete_pose {name}` | remove a saved pose |
+| `~/list_poses` | list names + poses |
+
+Plus `~/ee_pose` (`PoseStamped`, live EE pose, ~20 Hz) and `~/plan_state`
+(`String`, latched: `idle` / `planning` / `moving k/n` / `reached` / `aborted …`
+/ `unreachable`).
+
+```bash
+# software-only twin: RViz + robot_state_publisher + servo (services included)
+ros2 launch arm_teleop twin.launch.py
+# drive it from a 2nd terminal:  ros2 run arm_teleop keyboard_servo
+
+ros2 service call /servo_node/save_pose  rescue_interfaces/srv/SavePose  "{name: inspect}"
+ros2 service call /servo_node/list_poses rescue_interfaces/srv/ListPoses "{}"
+ros2 service call /servo_node/go_to_pose rescue_interfaces/srv/GoToPose  "{name: inspect}"
+```
+
+Needs `python-fcl` + `trimesh` for collision-aware planning (same dep as the
+runtime checker); without them the planner falls back to a limits-only validity
+check. RRT tuning (`rrt_step`, `rrt_resolution`, `rrt_max_time`, `rrt_seed`) and
+IK tolerances live in `config/servo_params.yaml`.
+
+> **Caveat:** a *go* moves the **physical** arm autonomously (via the bridge). It
+> is gated on `respect_fault` and is instantly stick-overridable; saved poses are
+> only meaningful relative to the same boot-zero (`initial_positions`).
+
 ## Run
 
 ```bash
@@ -91,10 +205,15 @@ ros2 launch arm_teleop keyboard.launch.py
 
 # servo + joystick (needs ros-<distro>-joy)
 ros2 launch arm_teleop joystick.launch.py
+
+# everything (full-robot twin + servo + flipper bridge + GUI) — see above
+ros2 launch gui bringup.launch.py
 ```
 
-On the robot, `esp32_bridge` consumes `/joint_states` → `MSG_ARM_JOINTS`. Its
-`joint_names` param must match (`Joint1..Joint6`, now the default).
+On the robot, `esp32_bridge` consumes `/joint_states` → `MSG_ARM_JOINTS`. It must
+ignore the flipper joints and forward only `Joint1..Joint6` (its `joint_names`
+param, now the default); `flipper_state` and `servo_node` co-publish on
+`/joint_states`.
 
 ## Tuning (`config/servo_params.yaml`)
 
@@ -110,6 +229,11 @@ On the robot, `esp32_bridge` consumes `/joint_states` → `MSG_ARM_JOINTS`. Its
 | `collision_check` | master enable for mesh self-collision avoidance |
 | `collision_slow_dist` / `_stop_dist` | clearance (m) to start damping / veto approach |
 | `collision_acm_samples` | configs sampled to learn the allowed-collision matrix |
+| `body_collision` | master enable for arm-vs-body (chassis + flippers) avoidance |
+| `body_collision_slow_dist` / `_stop_dist` | clearance (m) to start damping / veto approach to the body |
+| `flipper_sample_deg` | ± flipper range sampled when learning the body ACM |
+| `ik_servo` | use the closed-form resolved-pose servo (off = differential SDLS) |
+| `ik_servo_sigma_min` / `_max_jump` | when to fall back from IK servo to SDLS (singularity / branch switch) |
 
 > **Bench-verify before powered motion:** `initial_positions` must match the
 > arm's actual startup pose, and the firmware `*_DIR_*` signs (J4/J5 = −1) must

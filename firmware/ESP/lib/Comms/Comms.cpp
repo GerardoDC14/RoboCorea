@@ -14,7 +14,6 @@ uint32_t Comms::s_last_rx_ms = 0;
 ArmJointsCallback    Comms::s_cb_arm        = nullptr;
 SensorEnableCallback Comms::s_cb_sensor     = nullptr;
 EstopCallback        Comms::s_cb_estop      = nullptr;
-KeybindCallback      Comms::s_cb_keybind    = nullptr;
 PpmCalibCallback     Comms::s_cb_ppm_calib  = nullptr;
 ArmLifecycleCallback Comms::s_cb_arm_life   = nullptr;
 ArmModeCallback      Comms::s_cb_arm_mode   = nullptr;
@@ -88,11 +87,8 @@ void Comms::processFrame(uint8_t type, const uint8_t* buf, uint16_t len) {
         case MSG_ESTOP_CLEAR:
             if (s_cb_estop) s_cb_estop(false);
             break;
-        case MSG_KEYBIND:
-            if (len == sizeof(KeybindPayload) && s_cb_keybind) {
-                KeybindPayload p; memcpy(&p, buf, sizeof(p)); s_cb_keybind(p);
-            }
-            break;
+        // MSG_KEYBIND (0x14) is reserved-unused — the RC uses a fixed control
+        // scheme now, so there is no keybind table to receive.
         case MSG_PPM_CALIB:
             if (len == sizeof(PpmCalibPayload) && s_cb_ppm_calib) {
                 PpmCalibPayload p; memcpy(&p, buf, sizeof(p)); s_cb_ppm_calib(p);
@@ -172,7 +168,8 @@ void Comms::sendStatus(const SystemStatus& s) {
     buf[1] = (s.ppm_connected    ? 0x01 : 0)
            | (s.minipc_connected ? 0x02 : 0)
            | (s.can_ok           ? 0x04 : 0)
-           | (s.estop            ? 0x08 : 0);
+           | (s.estop            ? 0x08 : 0)
+           | (s.virtual_flip     ? 0x10 : 0);
     buf[2] = s.sensor_mask;
     buf[3] = 0;
     sendFrame(MSG_STATUS, buf, sizeof(buf));
@@ -186,6 +183,14 @@ void Comms::sendGripper(float norm) {
 
 void Comms::sendArmLifecycle(const ArmLifecyclePayload& p) {
     sendFrame(MSG_ARM_LIFECYCLE, reinterpret_cast<const uint8_t*>(&p), sizeof(p));
+}
+
+void Comms::sendBoardIdentity() {
+    BoardIdentityPayload p;
+    p.role = (uint8_t)ROBOCOREA_BOARD_ROLE;
+    p.protocol_version = (uint8_t)ROBOCOREA_PROTOCOL_VERSION;
+    p.capabilities = (uint16_t)ROBOCOREA_BOARD_CAPABILITIES;
+    sendFrame(MSG_BOARD_IDENTITY, reinterpret_cast<const uint8_t*>(&p), sizeof(p));
 }
 
 bool Comms::isConnected() {

@@ -12,7 +12,10 @@
 #include <sensor_msgs/msg/magnetic_field.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/u_int8.hpp>
+#include <std_msgs/msg/u_int16.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 #include <atomic>
 
@@ -37,6 +40,11 @@ public:
     // decoded PCM into it via SpeechProcessor::pushAudio().
     SpeechProcessor* speechProcessor() const { return speech_processor_; }
 
+    // Re-read the Vosk grammar + audio-monitor preference from AppSettings and
+    // apply them to the live speech processor / audio toggle. Called by
+    // MainWindow after the settings dialog applies/resets.
+    void applySpeechAudioSettings();
+
 signals:
     void resetSourcesRequested();
     void settingsRequested();
@@ -45,6 +53,10 @@ signals:
     void imuUpdated(double yaw, double pitch, double roll);
     void telemetryReceived();   // heartbeat
     void uptimeUpdated(float uptime_s);
+    // Arm lifecycle (ROS thread → Qt thread).
+    void armStateUpdated(const QString& state);
+    void armModeUpdated(const QString& mode);
+    void armPresenceUpdated(int mask);
 
 public slots:
     // Called by VideoPanel when any widget selects/deselects the thermal source.
@@ -62,10 +74,19 @@ private slots:
     void onClearAll();
     void publishEstopState();
     void onSensorToggled();
+    // Arm lifecycle
+    void onArmStateUpdated(const QString& state);
+    void onArmModeUpdated(const QString& mode);
+    void onArmPresenceUpdated(int mask);
+    void onArmClicked();
+    void onDisarmClicked();
+    void onArmModeToggle();
 
 private:
     void setConnState(const QString& color, const QString& label);
     void publishSensorMask();
+    void callArmTrigger(const rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr& cli,
+                        const char* what);
 
     rclcpp::Node::SharedPtr node_;
 
@@ -112,4 +133,23 @@ private:
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr estop_pub_;
     QTimer*           estop_timer_;
     std::atomic<bool> estop_active_{false};
+
+    // ── Arm lifecycle (boots disarmed; arm/disarm + dexterity/chassis idle) ───
+    QLabel*      arm_state_indicator_;   // colored LED
+    QLabel*      arm_state_label_;       // UNINIT / INITIALIZING / READY / FAULT
+    QPushButton* arm_btn_;               // request arm/init
+    QPushButton* arm_disarm_btn_;        // request disarm
+    QPushButton* arm_mode_btn_;          // Dexterity ⇄ Chassis (idle J5/J6)
+    QLabel*      arm_can_dots_[6];       // per-joint CAN presence (J1..J6)
+    QString      arm_state_{"UNINIT"};
+    QString      arm_mode_{"DEXTERITY"};
+    bool         auto_arm_prompted_{false};   // one-shot startup arm prompt
+
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr arm_state_sub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr arm_mode_sub_;
+    rclcpp::Subscription<std_msgs::msg::UInt16>::SharedPtr arm_presence_sub_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr arm_cli_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr arm_disarm_cli_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr arm_dexterity_cli_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr arm_chassis_cli_;
 };

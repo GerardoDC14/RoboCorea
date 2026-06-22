@@ -45,7 +45,8 @@ navigation is planned but deferred (see §18).
 
 The system spans three compute domains that must cooperate:
 
-- **ESP32** (on a custom PCB) — hard-real-time motor/sensor I/O.
+- **ESP32 PCBs** (two identical custom PCBs) — hard-real-time I/O split by
+  firmware role: chassis/base on one board, arm on the other.
 - **NVIDIA Jetson Orin Nano** (on the robot) — a ROS 2 relay between the robot
   and the operator, plus on-robot sensors.
 - **Operator workstation** (a laptop) — the GUI, computer vision, and the arm
@@ -67,7 +68,7 @@ but expect logic bugs. It also contained code for *two* robots — **"Dicerox"**
 > checked-out working tree may be on `main`, which is older. When mining the
 > legacy code, prefer `git show origin/firmware:<path>`.
 
-RoboCorea keeps the good ideas (the binary UART protocol, the keybind/mode
+RoboCorea keeps the good ideas (the binary UART protocol, the RC mode/e-stop
 state machine, the flipper position-PID concept, the Qt GUI, the MoveIt arm
 stack) and makes these deliberate changes:
 
@@ -95,24 +96,27 @@ panels) carries over, adapted to the single-robot reality.
 ```
         ┌────────────────────────────── ROBOT ──────────────────────────────┐
         │                                                                    │
- RC TX  │   FS-iA6B                       ┌─────────── Custom PCB ─────────┐  │
- (held  │   receiver ──PPM (1 wire)──────►│            ESP32               │  │
-  by    │   (2.4 GHz)                     │  RC decode · mode FSM ·        │  │
-operator)                                 │  flipper cmd · VESC/arm CAN ·  │  │
-        │                                 │  LIS3MDL mag (I2C)  ·          │  │
-        │                                 │  binary UART telemetry         │  │
-        │                                 └───┬───────────────────┬────────┘  │
-        │                          CAN(MCP)   │                   │ USB        │
-        │                          500 kbps   ▼                   │ (serial    │
-        │   ┌──────────────────────────────────────────────┐     │  921600)   │
-        │   │  6× VESC (2 traction + 4 flipper)             │     │            │
-        │   │  3× ODrive (arm J1-J3) · ZE300 (J4) ·         │     │            │
-        │   │  2× LKTech (J5-J6)                            │     │            │
-        │   └──────────────────────────────────────────────┘     │            │
-        │                                                          ▼            │
+ RC TX  │   FS-iA6B                    ┌──── Chassis PCB / ESP32 ────┐       │
+ (held  │   receiver ──PPM (1 wire)───►│ RC decode · mode FSM ·      │       │
+  by    │   (2.4 GHz)                  │ traction/flipper VESC CAN · │       │
+operator)                              │ LIS3MDL · binary UART       │       │
+        │                              └──────┬───────────────┬──────┘       │
+        │                          CAN(MCP)   │               │ USB serial   │
+        │                          500 kbps   ▼               │ 921600       │
+        │   ┌──────────────────────────────┐  │               ▼              │
+        │   │ 6× VESC                      │  │   ┌── Arm PCB / ESP32 ────┐  │
+        │   │ 2 traction + 4 flipper       │  │   │ arm CAN relay +       │  │
+        │   └──────────────────────────────┘  │   │ lifecycle + UART     │  │
+        │                                     │   └──┬──────────┬───────┘  │
+        │                                     │ CAN  │          │ USB       │
+        │                                     │ 500k ▼          │ serial    │
+        │   ┌──────────────────────────────┐  │                 │ 921600    │
+        │   │ 3× ODrive · ZE300 · 2× LKTech │◄─┘                 │           │
+        │   └──────────────────────────────┘                    │           │
+        │                                                        ▼           │
         │   MLX90640 thermal ──I2C──►┌──────────── Jetson Orin Nano ────────┐  │
         │   2× C920 ──────────USB───►│   ROS 2 Humble (Ubuntu 22.04)        │  │
-        │   ZED2 stereo ──────USB───►│   • esp32_bridge (serial ⇄ topics)   │  │
+        │   ZED2 stereo ──────USB───►│   • esp32_bridge (2× serial ⇄ topics)│  │
         │   RPLidar A2M12 ────USB───►│   • thermal_camera node              │  │
         │   RF cams ╳ (driving;      │   • c920 H.264+Opus → SRT (front)    │  │
         │   → workstation)           │   • ZED2 / lidar drivers (future)    │  │
@@ -138,8 +142,8 @@ operator)                                 │  flipper cmd · VESC/arm CAN ·  �
    receiver on the robot → PPM → ESP32. This is the low-latency teleop path and
    works even if the network/ROS link is down (failsafe to neutral).
 2. **The network link** (Wi-Fi/Ethernet, ROS 2 DDS): Jetson ⇄ workstation.
-   Carries telemetry, sensor data, and *commands derived from the RC sticks*
-   (keybinds, calibration, **arm joint commands computed on the workstation**).
+   Carries telemetry, sensor data, PPM calibration, and **arm joint commands
+   computed on the workstation** (from its gamepad, not the RC sticks).
 
 **Video uses two paths, neither of them DDS.** The two **RF analog (FPV)
 cameras** are the *driving* feed: they transmit over their own 5.8 GHz RF link to
@@ -159,15 +163,15 @@ competition link, **not** ROS/DDS. Only the tiny **thermal** image traverses ROS
 | Component | Qty | Connection | Notes |
 |-----------|-----|------------|-------|
 | 6S 8 Ah LiPo battery | 1 | — | ~25.2 V full, ~22.2 V nominal. Powers everything. |
-| Custom PCB w/ ESP32 | 1 | — | DOIT ESP32 DevKit-class module. All robot I/O lands here except the Jetson-side sensors. |
+| Custom PCB w/ ESP32 | 2 | USB serial → Jetson; CAN per board | Identical hardware and firmware. `ROBOCOREA_BOARD_ROLE` selects **chassis** or **arm** at build time. |
 | BLDC motor (traction) | 2 | VESC → CAN | Left/right tracks, differential drive. **100:1** reduction. Hall sensors. |
 | BLDC motor (flipper) | 4 | VESC → CAN | FL, FR, RL, RR. Position-controlled (0–360°, wraps). **100:1** reduction. Hall sensors. **Identical to the traction motors.** |
 | VESC mini 6.7 Pro | 6 | CAN (MCP2515) | One per base motor. Traction = velocity (`SET_RPM`); flippers = position via an on-board LispBM script. Set each to **500 kbps** CAN before bus-up. |
-| FlySky FS-iA6B receiver | 1 | PPM → ESP32 GPIO4 | 6 channels multiplexed on one PPM wire. Paired with the operator's FlySky transmitter. |
-| 6-DOF robotic arm | 1 | Mixed CAN | J1–J3 ODrive, J4 ZE300, J5–J6 LKTech. See §8. Driven on the **same CAN bus**. |
-| NVIDIA Jetson Orin Nano | 1 | USB to ESP32; I2C/USB for sensors | Runs ROS 2 Humble on Ubuntu 22.04. Robot-side relay. |
+| FlySky FS-iA6B receiver | 1 | PPM → chassis ESP32 GPIO4 | 6 channels multiplexed on one PPM wire. Paired with the operator's FlySky transmitter. |
+| 6-DOF robotic arm | 1 | Mixed CAN → arm ESP32 | J1–J3 ODrive, J4 ZE300, J5–J6 LKTech. See §8. Driven on the **arm PCB's separate CAN bus**. |
+| NVIDIA Jetson Orin Nano | 1 | USB to both ESP32 PCBs; I2C/USB for sensors | Runs ROS 2 Humble on Ubuntu 22.04. Robot-side relay. |
 | MLX90640 thermal camera | 1 | **I2C → Jetson GPIO** | 32×24 thermal array. Read by a Jetson node, **not** the ESP32. |
-| LIS3MDL magnetometer | 1 | I2C → ESP32 | Heading reference. **The only sensor on the ESP32 I2C bus** (no IMU). |
+| LIS3MDL magnetometer | 1 | I2C → chassis ESP32 | Heading reference. **The only sensor on the ESP32 I2C bus** (no IMU). |
 | ZED2 stereo camera | 1 | USB → Jetson | Visual-inertial odometry **and the robot's orientation/IMU source** (replaces the dropped BNO055). Feeds the planned odometry EKF + future SLAM/nav. |
 | RPLidar A2M12 | 1 | USB → Jetson | 2D lidar for **future** SLAM/nav. |
 | RF (FPV) camera | 2 | 5.8 GHz RF → USB digitizer → **workstation** | Appear as `/dev/videoN` webcams. **Driving** feed (low-latency, low-res). |
@@ -175,13 +179,14 @@ competition link, **not** ROS/DDS. Only the tiny **thermal** image traverses ROS
 
 **Buses summary**
 
-- **ESP32 I2C** (`SDA=GPIO21`, `SCL=GPIO22`): LIS3MDL magnetometer (no IMU).
-- **ESP32 CAN** via an **on-board SMD MCP2515** over SPI
+- **Chassis ESP32 I2C** (`SDA=GPIO21`, `SCL=GPIO22`): LIS3MDL magnetometer (no IMU).
+- **Chassis ESP32 CAN** via an **on-board SMD MCP2515** over SPI
   (`CS=GPIO5`, `SCK=GPIO18`, `MISO=GPIO19`, `MOSI=GPIO23`, 8 MHz crystal),
-  **500 kbps**: all 6 VESCs + 3 ODrives + 1 ZE300 + 2 LKTech share this single
-  bus. (The CAN code also supports the ESP32 TWAI peripheral + SN65HVD230 as a
-  compile-time backend for a future board; its pins are placeholders.)
-- **ESP32 ⇄ Jetson**: USB serial, **921600 baud**, binary framed protocol (§9).
+  **500 kbps**: the 6 VESCs only (2 traction + 4 flippers).
+- **Arm ESP32 CAN** via the same MCP2515 hardware, **500 kbps**: 3 ODrives +
+  1 ZE300 + 2 LKTech. The two PCBs do **not** share one CAN bus.
+- **ESP32 PCBs ⇄ Jetson**: two USB serial links, **921600 baud**, binary framed
+  protocol with board identity (§9).
 - **Jetson I2C (GPIO)**: MLX90640.
 - **Jetson USB**: ZED2, RPLidar A2M12, **2× Logitech C920** (H.264 + Opus → SRT).
 - **Workstation USB**: 2× RF-camera digitizers.
@@ -193,29 +198,29 @@ competition link, **not** ROS/DDS. Only the tiny **thermal** image traverses ROS
 
 ## 5. Compute domains: what runs where
 
-| Process / responsibility | ESP32 | Jetson | Workstation |
-|--------------------------|:-----:|:------:|:-----------:|
-| RC/PPM decode, mode FSM, e-stop | ✅ | | |
-| Traction differential mixing → VESC RPM | ✅ | | |
-| Flipper stick → target angle (loop closed on the VESC) | ✅ | | |
-| Arm CAN relay (ODrive/ZE300/LKTech) | ✅ | | |
-| LIS3MDL magnetometer read | ✅ | | |
-| Binary UART telemetry/commands | ✅ | | |
-| Serial ⇄ ROS 2 bridge (`esp32_bridge`) | | ✅ | |
-| MLX90640 thermal → ROS `Image` | | ✅ | |
-| C920 H.264 + Opus → SRT (GStreamer streamer) | | ✅ | |
-| ZED2 + RPLidar drivers (future SLAM) | | ✅ | |
-| Operator GUI (Qt6) | | | ✅ |
-| C920 A/V SRT receive + speech (Vosk) | | | ✅ |
-| Computer vision (YOLO hazmat) on the C920 streams | | | ✅ |
-| MoveIt Servo + arm IK | | | ✅ |
-| RC-stick → arm twist mapping (`rc_servo`) | | | ✅ |
-| Holds the RC transmitter | | | 👤 |
+| Process / responsibility | Chassis ESP32 | Arm ESP32 | Jetson | Workstation |
+|--------------------------|:------------:|:---------:|:------:|:-----------:|
+| RC/PPM decode, mode FSM, e-stop | ✅ | | | |
+| Traction differential mixing → VESC RPM | ✅ | | | |
+| Flipper stick → target angle (loop closed on the VESC) | ✅ | | | |
+| Arm CAN relay (ODrive/ZE300/LKTech) | | ✅ | | |
+| LIS3MDL magnetometer read | ✅ | | | |
+| Binary UART telemetry/commands | ✅ | ✅ | | |
+| Serial ⇄ ROS 2 bridge (`esp32_bridge`) | | | ✅ | |
+| MLX90640 thermal → ROS `Image` | | | ✅ | |
+| C920 H.264 + Opus → SRT (GStreamer streamer) | | | ✅ | |
+| ZED2 + RPLidar drivers (future SLAM) | | | ✅ | |
+| Operator GUI (Qt6) | | | | ✅ |
+| C920 A/V SRT receive + speech (Vosk) | | | | ✅ |
+| Computer vision (YOLO hazmat) on the C920 streams | | | | ✅ |
+| MoveIt Servo + arm IK | | | | ✅ |
+| Gamepad → arm twist mapping (`joystick_servo`) | | | | ✅ |
+| Holds the RC transmitter | | | | 👤 |
 
 **Why the arm runs on the workstation:** the Jetson is intentionally a thin
-relay. The arm joint commands are computed on the workstation from the relayed
-RC sticks, then sent **back** down: workstation → (network) → Jetson
-`esp32_bridge` → (USB serial) → ESP32 → (CAN) → arm drivers. See §13.
+relay. The arm joint commands are computed on the workstation from the gamepad/
+servo stack, then sent **back** down: workstation → (network) → Jetson
+`esp32_bridge` → (USB serial) → arm ESP32 → (arm CAN) → arm drivers. See §13.
 
 ---
 
@@ -233,8 +238,8 @@ RoboCorea/
 │       └── src/
 │           ├── esp32_bridge/ # Serial ⇄ ROS 2 bridge — IMPLEMENTED
 │           └── gui/          # Qt6 operator console — video/dashboard/odometry/
-│                             #   speech/twin/CV-filters IMPLEMENTED; config
-│                             #   dialogs TODO (other packages below are planned)
+│                             #   speech/twin/CV-filters/config-dialogs IMPLEMENTED
+│                             #   (other packages below are planned)
 │
 └── reference/
     ├── architecture.md       # ← THIS FILE. The source of truth.
@@ -246,20 +251,20 @@ A **single** `ros2_ws` is used on both Linux machines because they share custom
 message types and many launch files; hosts simply run different subsets.
 **Implemented so far:** the ESP32 firmware (`firmware/ESP`), the `esp32_bridge`
 node, and the `gui` package's video + dashboard + odometry + speech + digital
-twin + in-GUI CV filter subsystems (only its config dialogs are still TODO). The
-rest of the packages below are planned:
+twin + in-GUI CV filter + config-dialog subsystems. The rest of the packages
+below are planned:
 
 | Package | Lang | Runs on | Purpose |
 |---------|------|---------|---------|
-| `rescue_interfaces` | msg/srv | both | Shared custom message & service definitions. |
+| `rescue_interfaces` | msg/srv | both | Shared custom message & service definitions. **(arm saved-pose services implemented: SavePose/GoToPose/DeletePose/ListPoses)** |
 | `esp32_bridge` | Python | Jetson | Serial binary protocol ⇄ ROS 2 topics. The relay core. **(implemented)** |
 | `thermal_camera` | Python | Jetson | MLX90640 I2C → `/sensors/thermal` (`Image`). |
 | `rescue_nav` *(future)* | mixed | Jetson | ZED2 odometry + RPLidar + `slam_toolbox`. Deferred. |
-| `gui` | C++/Qt6 | Workstation | Operator GUI (video, thermal, dashboard, digital twin, dialogs). **Video/dashboard/odometry/speech/twin/CV-filters implemented; config dialogs TODO.** |
+| `gui` | C++/Qt6 | Workstation | Operator GUI (video, thermal, dashboard, digital twin, dialogs). Hosts the workstation **`bringup.launch.py`** (GUI + servo + flipper_state + twin) and the **arm arm/disarm + dexterity/chassis controls** in the dashboard. **Video/dashboard/odometry/speech/twin/CV-filters + config dialogs (settings + PPM-calib) implemented.** |
 | `rescue_vision` | Python | Workstation | YOLO hazmat detection on the C920 streams. |
-| `arm_description` | xacro/STL | Workstation | URDF + meshes for the 6-DOF arm (and base, for the digital twin). |
+| `arm_description` | URDF/STL | Workstation | **Combined** robot URDF (arm + chassis + 4 flippers) + chassis/flipper meshes, for the digital twin and the arm's body-collision. **(implemented: `dicerox_full.urdf`; MoveIt-specific config still deferred)** |
 | `arm_moveit` | config | Workstation | MoveIt 2 config + Servo + launch. |
-| `arm_teleop` | Python | Workstation | `rc_servo` (PPM→twist), joint relay/bridge to `/arm/joint_command`. |
+| `arm_teleop` | Python | Workstation | SDLS servo (self- **and** body-collision), saved-pose RRT planning, keyboard/joystick teleop, and `flipper_state` (`/encoders/flipper`→`/joint_states`). The one-shot workstation bring-up now lives in **`gui/bringup.launch.py`** (the operator console owns it). The arm is jogged from the workstation **gamepad** (`joystick_servo`), not the RC. |
 | `rescue_bringup` | launch | both | Per-host launch files + convenience scripts. |
 
 (Names are proposals; the legacy equivalents are `esp32_bridge`, `gui`,
@@ -270,8 +275,9 @@ rest of the packages below are planned:
 ## 7. Firmware (ESP32)
 
 PlatformIO project targeting a DOIT ESP32 DevKit V1 (Arduino framework, both
-cores at 240 MHz). Unlike the legacy firmware, there is **no `ROBOT_MAIN` /
-`ROBOT_SECONDARY` switch** — there is one robot.
+cores at 240 MHz). The same firmware runs on both identical PCBs; the only
+intended per-board build difference is `ROBOCOREA_BOARD_ROLE` in `config.h`
+(`CHASSIS` by default, or `ARM` for the arm PCB).
 
 ### 7.1 Module structure
 
@@ -282,13 +288,13 @@ firmware/
   ESP/
     platformio.ini
     include/
-      config.h          # Pins, CAN IDs, gear ratios, flipper params, protocol IDs
-      robot_types.h     # Enums (RobotMode, ChannelFunction), structs, packed payloads
+      config.h          # Board role, pins, CAN IDs, gear ratios, flipper params, protocol IDs
+      robot_types.h     # Enums (RobotMode), structs, packed payloads
     lib/
       RC/               # PPM receiver decode (ISR + sync-gap framing)
-      Control/          # Mode state machine, keybind application, flipper setpoint integration
+      Control/          # Mode state machine, fixed RC control mapping, flipper setpoint integration
       Locomotion/       # Differential mixing + flipper target angle / hold → VESC
-      CANInterface/     # CAN HAL (MCP2515 active / TWAI optional); VESC + ODrive + ZE300 + LKTech
+      CANInterface/     # CAN HAL (MCP2515 active / TWAI optional); gated by board role
       Comms/            # Binary UART protocol TX/RX
       Sensors/          # LIS3MDL magnetometer (I2C; no IMU — orientation from ZED2)
       PID/              # Reusable PID (shortest-angle + D low-pass) — spare; flippers loop on the VESC
@@ -306,15 +312,15 @@ firmware/
 
 ### 7.2 FreeRTOS tasks
 
-Two cores, ~4 tasks (down from legacy 5 — no thermal task, thermal is on the
-Jetson now):
+Two cores, role-gated tasks (down from legacy 5 — no thermal task, thermal is on
+the Jetson now):
 
 | Core | Task | Rate | Priority | Purpose |
 |------|------|------|----------|---------|
-| 0 | `commsTask` | 50 Hz | 4 | UART RX parse + TX telemetry |
-| 0 | `canTask` | 200 Hz | 4 | CAN poll; VESC/ODrive/ZE300/LKTech TX + status parse + bus-health recovery |
-| 1 | `controlTask` | 50 Hz | 5 (highest) | Mode FSM, keybind logic, flipper setpoint integration, motor output |
-| 1 | `sensorTask` | ≤50 Hz | 2 | LIS3MDL magnetometer sampling |
+| 0 | `commsTask` | 50 Hz | 4 | UART RX parse + identity + role-owned telemetry |
+| 0 | `canTask` | 200 Hz | 4 | CAN poll; chassis parses VESCs, arm parses/polls ODrive/ZE300/LKTech |
+| 1 | `controlTask` | 50 Hz | 5 (highest) | Chassis: RC/base FSM; arm: relay latest joint command when armed |
+| 1 | `sensorTask` | ≤50 Hz | 2 | Chassis role only: LIS3MDL magnetometer sampling |
 
 `controlTask` uses `vTaskDelayUntil` for a strict, drift-free period. The
 control loop target is **50 Hz**.
@@ -334,18 +340,6 @@ control loop target is **50 Hz**.
     **holds** where it is released (center = hold). Direction sign
     (`FLIPPER_DIR_*`) is applied here. Optional soft limits, else the target wraps
     `[0, 360)`.
-  - **Collision avoidance (dynamic limits).** The front and rear flipper on each
-    side share a side-view plane and can ram each other when they lean together
-    (e.g. rear up-forward + front up-back meeting over the chassis). Before each
-    target step is committed, the ESP computes the segment-to-segment clearance of
-    the pair — geometry from `config.h` (`FLIPPER_PIVOT_SPACING_M` *x*,
-    `FLIPPER_LENGTH_M` *y*, with a collision zone only when `2y > x > y`) — against
-    the **partner's measured angle**, and refuses any step that would close them
-    below `FLIPPER_COLLISION_MARGIN_M`. The flipper holds at the boundary and
-    frees the instant the stick reverses or the other flipper backs off (reactive,
-    decoupled — no autonomous re-routing). Math + the `2y>x>y` `static_assert` live
-    in `lib/Control/FlipperCollision.h`; disable with
-    `FLIPPER_COLLISION_AVOID_ENABLE 0`.
   - **Transport.** The ESP sends the absolute wrapped target to the flipper VESC
     in a **custom CAN frame** (`VESC_CMD_FLIPPER_TARGET 0x7E`; *not* `SET_RPM`,
     which would engage the VESC's own speed loop and fight the lisp's
@@ -376,13 +370,14 @@ control loop target is **50 Hz**.
 
 ## 8. CAN bus & motor protocols
 
-All motors share **one 500 kbps CAN 2.0 bus** through an **on-board SMD MCP2515**
-over SPI (`CS=GPIO5, SCK=GPIO18, MISO=GPIO19, MOSI=GPIO23`, 8 MHz). **Every
-controller must be set to 500 kbps before joining the bus** (ODrive defaults to
-250 kbps — change and save it first). The CAN code is backend-agnostic: a
-compile-time switch in `config.h` selects MCP2515 (active) or the ESP32 TWAI
-peripheral + SN65HVD230 (future board, placeholder pins). The HAL adds bus-off /
-fault recovery and a cross-core SPI mutex for the MCP2515 path.
+Each ESP32 PCB has its **own 500 kbps CAN 2.0 bus** through the same on-board
+SMD MCP2515 over SPI (`CS=GPIO5, SCK=GPIO18, MISO=GPIO19, MOSI=GPIO23`, 8 MHz).
+The chassis bus carries only the 6 VESCs; the arm bus carries only the mixed-CAN
+arm. **Every controller must be set to 500 kbps before joining its bus** (ODrive
+defaults to 250 kbps — change and save it first). The CAN code is backend-
+agnostic: a compile-time switch in `config.h` selects MCP2515 (active) or the
+ESP32 TWAI peripheral + SN65HVD230 (future board, placeholder pins). The HAL adds
+bus-off / fault recovery and a cross-core SPI mutex for the MCP2515 path.
 
 ### 8.1 VESC — traction + flippers (6 controllers)
 
@@ -458,7 +453,9 @@ fault recovery and a cross-core SPI mutex for the MCP2515 path.
 
 ## 9. ESP32 ⇄ Jetson binary UART protocol
 
-USB serial, **921600 baud**. Plain binary framing (no micro-ROS).
+Two USB serial links, **921600 baud** each. Plain binary framing (no micro-ROS).
+Both ESP32s periodically send `MSG_BOARD_IDENTITY`, so the Jetson can dynamically
+bind whichever `/dev/serial/...` path is the chassis PCB or arm PCB.
 
 **Frame:** `[0xAA][0x55][TYPE:1][LEN_H:1][LEN_L:1][PAYLOAD:LEN][CRC:1]`
 **CRC** = XOR of `TYPE`, `LEN_H`, `LEN_L`, and every payload byte.
@@ -479,6 +476,8 @@ firmware (`robot_types.h`) and the bridge (Python `struct`).
 | 0x0B | LKTech status | per-joint (J5/J6) telemetry |
 | 0x0C | ZE300 status | J4 telemetry |
 | 0x0D | ODrive error | per-node motor_error (optional) |
+| 0x0E | Arm lifecycle | arm state, fault, presence mask, operating mode, active joints |
+| 0x0F | Board identity | role, protocol version, capability bitmask |
 
 > Removed vs. legacy: **0x02 Thermal** (now a Jetson node), **0x04 Gas** (sensor
 > dropped), **0x06 IMU** (BNO055 removed — orientation comes from the ZED2),
@@ -493,11 +492,14 @@ firmware (`robot_types.h`) and the bridge (Python `struct`).
 | 0x11 | Sensor enable | 1-byte bitmask (mag; imu/thermal/gas bits reserved-unused) |
 | 0x12 | E-stop | (empty) — immediate stop |
 | 0x13 | E-stop clear | (empty) — resume |
-| 0x14 | Keybind | 15 bytes (3 modes × 5 channel slots) |
+| 0x14 | *(reserved)* | was Keybind — the RC uses a fixed control scheme now (§13.2) |
 | 0x15 | PPM calibration | 6 ch × (min, neutral, max) uint16 + deadband |
 | 0x16 | Gripper | int16 normalized ×1000 |
 
-The bridge translates each of these to/from ROS 2 topics (§12).
+The bridge translates each of these to/from ROS 2 topics (§12) and routes
+outbound frames by role: arm joints/lifecycle commands go to the arm PCB; sensor
+enable and PPM calibration go to the chassis PCB; software e-stop is sent to all
+discovered ESP32 links.
 
 ---
 
@@ -506,14 +508,15 @@ The bridge translates each of these to/from ROS 2 topics (§12).
 The Jetson runs ROS 2 Humble and acts as the bridge between the robot's
 hardware and the operator network. Planned nodes:
 
-- **`esp32_bridge`** (Python). Owns `/dev/ttyUSB*` to the ESP32. Parses the
-  binary protocol into ROS topics and serializes inbound topics back into
-  frames. This is the heart of the relay. (Direct port of the legacy
-  `esp32_bridge/main_bridge.py`, trimmed: no thermal/gas, **no IMU** — traction
-  speed comes from VESC status.) It also **integrates the two traction VESCs'
-  tachometers into track wheel odometry**, published as `nav_msgs/Odometry` on
-  `/odom/wheel` (with skid-steer covariances; **no TF** — the EKF owns
-  `odom→base_link`). Wheel/track geometry is set via node parameters.
+- **`esp32_bridge`** (Python). Scans an allowlist of serial device globs
+  (default `/dev/serial/by-id/*,/dev/serial/by-path/*`), opens candidate ESP32
+  links, and binds them by `MSG_BOARD_IDENTITY` as **chassis** or **arm**. It
+  publishes the same public topics as the old one-port bridge while routing
+  outbound commands to the owning PCB. It also **integrates the two traction
+  VESCs' tachometers into track wheel odometry**, published as
+  `nav_msgs/Odometry` on `/odom/wheel` (with skid-steer covariances; **no TF** —
+  the EKF owns `odom→base_link`). Wheel/track geometry is set via node
+  parameters.
 - **`thermal_camera`** (Python). Reads the MLX90640 over the Jetson's I2C GPIO
   and publishes `/sensors/thermal` as a 32×24 `sensor_msgs/Image` (°C float).
   *New on the Jetson — was on the ESP32 in legacy.*
@@ -542,31 +545,33 @@ transmitter. Planned packages:
 
 - **`gui`** (C++/Qt6). The operator console. Ported almost verbatim from the
   legacy `gui` package, with the dual-robot support stripped out (Dicerox only).
-  Video, dashboard, odometry, speech, the **digital twin**, and the **in-GUI CV
-  filters** are implemented; only the config dialogs remain. **Detailed design
-  in §11.1.**
+  Video, dashboard, odometry, speech, the **digital twin**, the **in-GUI CV
+  filters**, and the **config dialogs** (settings + PPM calibration; no keybind
+  editor — the RC scheme is fixed, §13.2) are implemented. The dashboard also
+  hosts the **arm arm/disarm + dexterity/
+  chassis lifecycle controls** (§16), and the package owns the workstation
+  **`bringup.launch.py`**. **Detailed design in §11.1.**
 - **`rescue_vision`** (Python). YOLO **hazmat** detection (HazMat label set)
   on the **C920 streams** (clean digital frames, not the noisy RF driving feed).
   A trained model + ONNX export exist in the legacy repo (`shared/vision/`); copy
   it to `gui/assets/vision/best.onnx` for the in-GUI Hazmat filter. The GUI runs
   inference through **ONNX Runtime** (CUDA EP + CPU fallback), so the export opset
   is unconstrained.
-- **Arm stack** (`arm_description` + `arm_moveit` + `arm_teleop`):
-  - `arm_teleop/rc_servo`: subscribes to the relayed `/robot/ppm`,
-    `/robot/mode`, `/robot/keybind`, `/robot/deadband`; when mode == `ARM`,
-    maps the configured channels to a `geometry_msgs/TwistStamped` on
-    `/servo_node/delta_twist_cmds`.
-  - **MoveIt Servo** turns that Cartesian twist into joint motion (IK) and
-    produces joint angles.
-  - A joint relay publishes the 6 angles on `/arm/joint_command`, which the
-    bridge (on the Jetson) sends down as `MSG_ARM_JOINTS`.
+- **Arm stack** (`arm_description` + `arm_moveit` + `arm_teleop`): the arm is
+  driven from the **workstation gamepad**, not the RC (the RC scheme is drive +
+  flippers only, §13.2).
+  - `arm_teleop/joystick_servo` maps gamepad axes to a
+    `geometry_msgs/TwistStamped` on `/servo_node/delta_twist_cmds`.
+  - The **SDLS servo** turns that Cartesian twist into joint motion (IK) and
+    publishes the 6 angles on `/joint_states`, which the bridge (on the Jetson)
+    sends down as `MSG_ARM_JOINTS`. (The old RC-stick `rc_servo` path is dropped.)
 - **Audio / speech** *(implemented)*: the front C920's microphone is encoded as
   **Opus** and muxed into that camera's A/V SRT stream (§11.1). The GUI decodes
   it natively (GStreamer), plays it on the operator's speakers, and feeds it to
   **Vosk** for live transcription on the dashboard. No `/audio` ROS topic and no
   PulseAudio — this replaces the legacy raw-PCM-over-DDS path that was lossy/laggy.
 
-### 11.1 GUI internals (ported from the legacy `gui`, Dicerox only — video/dashboard/odometry/speech/twin/CV-filters implemented; config dialogs TODO)
+### 11.1 GUI internals (ported from the legacy `gui`, Dicerox only — video/dashboard/odometry/speech/twin/CV-filters/config-dialogs implemented)
 
 A single C++/Qt6 executable that is also a ROS 2 node. `rclcpp::spin` runs on a
 **dedicated thread**; ROS callbacks marshal onto the Qt main thread via Qt
@@ -584,17 +589,18 @@ both are visible at once under the twin.)
 
 | Class | Role |
 |-------|------|
-| `MainWindow` | Owns panels; publishes `/robot/keybind` + `/robot/ppm_calib`; opens `SettingsDialog`. |
+| `MainWindow` | Owns panels; publishes `/robot/ppm_calib`; opens `SettingsDialog`. |
 | `CameraHub` | Ref-counted frame provider keyed by source URI — one decode per source, shared by widgets, auto-reconnecting. Opens `local:N` (V4L2) and `gst:<pipe>` (GStreamer/SRT); also hosts externally-registered A/V sources (`av:<i>`, see `GstAvStream`). |
 | `SourceManager` | Discovers sources: local webcams (`probeLocalCameras`), the configured **C920 SRT streams** (from `AppSettings`), and thermal ROS topics (`probeThermalTopics` + a `/config` subscription). Emits `sourcesUpdated`. |
 | `VideoPanel` / `VideoWidget` | 2×2 grid of feeds; click-to-enlarge; each widget runs its own filter pipeline on a worker thread and can select any source (incl. thermal). An enlarged cell supports **zoom + pan** (on-screen +/−/Fit buttons or Ctrl+scroll to zoom — trackpad pinch only on Wayland, not X11; two-finger scroll / drag to pan), applied as an ROI crop+upscale of the source frame **before** the filter pipeline (so the CV runs on the zoomed region); resets to fit on collapse. |
 | `FilterRegistry` / `filters` | Self-registering CV filters with a thread-safe `FilterConfig` (atomics). Per-widget instances. |
 | `OdometryPanel` | Track speeds, **track wheel-odometry (x/y/yaw/vx from `/odom/wheel`)**, 4 flipper angles, **per-VESC rows (the six VESC IDs)**, and arm telemetry (ODrive/LKTech/ZE300). |
-| `DashboardPanel` | Connection LED + heartbeat, magnetometer readout (+ enable toggle), **orientation readout from the ZED2 IMU**, **e-stop button**, audio toggle, settings button. |
-| `DigitalTwinPanel` / `UrdfViewer` | OpenGL 3-D view of the arm (+ base) URDF, posed from `/joint_states` (or `/arm/joint_command`). |
+| `DashboardPanel` | Connection LED + heartbeat, magnetometer readout (+ enable toggle), **orientation readout from the ZED2 IMU**, **e-stop button**, **arm arm/disarm + dexterity/chassis controls**, audio toggle, settings button. |
+| `DigitalTwinPanel` / `UrdfViewer` | OpenGL 3-D view of the **combined** arm + chassis + flipper URDF, posed from `/joint_states` (arm joints from `servo_node`, flipper joints from `flipper_state`). |
+| `ArmPosePanel` | Saved-pose controls under the twin: a thin client of the `servo_node` save/go/delete/list services with inline per-pose twin thumbnails. Mirrors the pose-name list + selection to `~/.config/robocorea_gui/saved_poses.json` and renders to `pose_thumbs/` so the dropdown is populated at launch before the servo connects (server stays authoritative, §12). |
 | `GstAvStream` | Native-GStreamer receiver for the front C920's **A/V SRT** stream: `srtsrc ! tsdemux` → video appsink (shown via `CameraHub`) + `opusdec ! tee` → speakers **and** an appsink feeding `SpeechProcessor`. Auto-reconnects. |
 | `SpeechProcessor` | Vosk transcription, fed 16 kHz PCM by `GstAvStream` (the C920 A/V stream's Opus track) via `pushAudio()`. |
-| `SettingsDialog` / `KeybindDialog` / `PpmCalibDialog` | Robot config: keybind editor, PPM calibration + deadband, thermal colormap/interp, detection-label scale. |
+| `SettingsDialog` / `PpmCalibDialog` | Robot config: PPM calibration + deadband, thermal colormap/interp, detection-label scale. (No keybind editor — the RC control scheme is fixed, §13.2.) |
 
 **Cameras (changed from legacy):** three source kinds, none through DDS. (1) The
 **RF driving cams** are local webcams — `CameraHub` opens `/dev/video*` directly
@@ -613,13 +619,16 @@ detection. Each cell runs its own filter instance with a thread-safe
 `rescue_vision` package can also run detection as a separate node; the in-GUI
 filter is the legacy path.
 
-**Topics:** publishes `/robot/keybind` + `/robot/ppm_calib` (reliable +
-transient-local), `/robot/estop` (Bool, republished ~10 Hz), and
-`/sensors/enable_mask` (UInt8: bit0 mag, bit1 thermal; imu bit reserved-unused).
+**Topics:** publishes `/robot/ppm_calib` (reliable + transient-local),
+`/robot/estop` (Bool, republished ~10 Hz), and `/sensors/enable_mask` (UInt8:
+bit0 mag, bit1 thermal; imu bit reserved-unused).
 Subscribes to the telemetry/sensor/motor/mode/flags topics from §12, plus
-`/odom/wheel` (track odometry), `/sensors/thermal`, and the **ZED2 IMU** topic
-(orientation readout). The C920 video/audio are **not** ROS topics — they arrive
-over SRT; the audio-monitor toggle is a local mute, not a published command.
+`/odom/wheel` (track odometry), `/sensors/thermal`, the **ZED2 IMU** topic
+(orientation readout), and the latched **arm lifecycle** topics
+(`/arm/state`, `/arm/operating_mode`, `/arm/can_presence`); the dashboard also
+**calls** the `/arm/{arm,disarm,mode/dexterity,mode/chassis}` `Trigger` services
+(§16). The C920 video/audio are **not** ROS topics — they arrive over SRT; the
+audio-monitor toggle is a local mute, not a published command.
 
 **Dicerox-only simplifications vs legacy:**
 - Drop the `robot_type` (Jaguar/Dicerox) switch in `AppSettings`, `OdometryPanel`,
@@ -629,8 +638,8 @@ over SRT; the audio-monitor toggle is a local mute, not a published command.
   readout now comes from the **ZED2 IMU** (no ESP32 IMU, so no IMU enable toggle).
 - Odometry shows the VESC table (6 IDs) + arm telemetry; remove the legacy
   "main motor / PWM duty" section (that was the Jaguar PWM robot).
-- Default keybind table should match the firmware default in
-  [`Control.cpp`](../firmware/ESP/lib/Control/Control.cpp).
+- No keybind editor — the RC control scheme is fixed in the firmware (§13.2); the
+  only RC config in the GUI is PPM calibration.
 
 Build deps (Qt6 **incl. OpenGL/OpenGLWidgets**, OpenCV w/ GStreamer, **GStreamer
 dev + SRT/Opus plugins**, Vosk; and — for the CV filters + digital twin —
@@ -647,7 +656,9 @@ the Hazmat filter shows a "model not loaded" overlay and everything else runs.
 
 These flow over DDS between the Jetson (`esp32_bridge`, `thermal_camera`) and
 the workstation (`gui`, arm stack, vision). Names/types follow the legacy
-contract so the GUI and bridge stay compatible.
+contract so the GUI and bridge stay compatible. `esp32_bridge` keeps the public
+topic names stable even though the data now comes from two identity-bound ESP32
+links.
 
 ### Published by `esp32_bridge` (robot → PC)
 
@@ -677,22 +688,48 @@ contract so the GUI and bridge stay compatible.
 | Topic | Type | Content |
 |-------|------|---------|
 | `/robot/estop` | `Bool` | true = e-stop, false = clear |
-| `/arm/joint_command` | `Float32MultiArray` | 6 joint angles (deg) |
+| `/joint_states` | `sensor_msgs/JointState` | arm joint positions (rad), forwarded to the arm ESP32 |
 | `/sensors/enable_mask` | `UInt8` | bits: mag (imu/thermal/gas reserved-unused) |
-| `/robot/keybind` | `UInt8MultiArray` | 15 bytes (3 modes × 5 channels) |
 | `/robot/ppm_calib` | `UInt16MultiArray` | 6ch × (min, neutral, max) |
 | `/gripper` | `Float32` | gripper command |
 
 ### Published by `gui`
 
-`/robot/keybind`, `/robot/ppm_calib` (reliable + transient-local),
-`/robot/estop` (republished ~10 Hz), `/sensors/enable_mask`. (No `/audio` topic —
-the C920 audio rides SRT and is decoded in the GUI.)
+`/robot/ppm_calib` (reliable + transient-local), `/robot/estop` (republished
+~10 Hz), `/sensors/enable_mask`. (No `/robot/keybind` — the RC control scheme is
+fixed, see §13.2. No `/audio` topic — the C920 audio rides SRT and is decoded in
+the GUI.)
 
 ### Arm stack
 
-`rc_servo` → `/servo_node/delta_twist_cmds` (`TwistStamped`); MoveIt Servo →
-joint trajectory → relay → `/arm/joint_command`.
+`joystick_servo` (workstation gamepad) → `/servo_node/delta_twist_cmds`
+(`TwistStamped`); the SDLS servo integrates that into `/joint_states` (which the
+bridge forwards as `MSG_ARM_JOINTS`).
+
+**Saved poses / go-to-pose** (served by `servo_node`, used by the GUI digital-twin
+panel and CLI/RViz; defs in the **`rescue_interfaces`** package):
+
+| Interface | Type | Content |
+|-----------|------|---------|
+| `~/save_pose` | `rescue_interfaces/srv/SavePose` | snapshot current EE pose under a name |
+| `~/go_to_pose` | `rescue_interfaces/srv/GoToPose` | IK + **RRT** plan a collision-free path to a saved/inline pose and execute it |
+| `~/delete_pose` / `~/list_poses` | `rescue_interfaces/srv/*` | manage the pose library |
+| `~/ee_pose` | `geometry_msgs/PoseStamped` | live end-effector pose (~20 Hz) |
+| `~/plan_state` | `std_msgs/String` (latched) | `idle`/`planning`/`moving k/n`/`reached`/`aborted`/`unreachable` |
+
+The pose library persists **server-side** — the `servo_node` is the source of
+truth, writing `~/.config/robocorea_arm/poses.yaml` (name → EE pose + joint
+snapshot) on every save/delete and reloading it at startup, so poses survive
+servo restarts, rebuilds and reboots. The **GUI** keeps a thin local mirror in
+`~/.config/robocorea_gui/`: `saved_poses.json` (the pose-name list + the
+selected name, so the dropdown is populated instantly at launch before the servo
+is reachable) and `pose_thumbs/<name>.png` (the per-pose twin render shown inline
+in the dropdown — the servo does not store these). On startup the panel shows the
+cached names, then calls `list_poses` to reconcile with the servo (authoritative);
+the cache is refreshed on every save/delete/list. Planning runs on a worker
+thread; a non-zero stick/twist, a fault, or `pause_servo` aborts an in-progress
+move (operator override). See
+[`arm_teleop/README.md`](../software/ros2_ws/src/arm_teleop/README.md).
 
 ---
 
@@ -700,28 +737,49 @@ joint trajectory → relay → `/arm/joint_command`.
 
 ### 13.1 Mode state machine (on the ESP32)
 
-`RobotMode`: `INIT → STANDBY → NORMAL / FLIPPER / ARM`, plus `ESTOP`.
+`RobotMode`: `INIT → STANDBY → NORMAL`, plus `ESTOP`. (The legacy `FLIPPER` and
+`ARM` modes are gone — see §13.2 — but their enum values are kept reserved for
+protocol stability.)
 
 | Mode | Behavior |
 |------|----------|
 | INIT | Hardware init at boot. |
 | STANDBY | Idle, waiting for a valid RC link. |
-| NORMAL | RC drives the tracks (differential). |
-| FLIPPER | RC drives the flippers (position). |
-| ARM | Tracks stopped; RC input is **forwarded to the PC** for IK, and the arm follows joint commands that come back. |
-| ESTOP | All outputs neutralized; cleared **only** by the PC (`MSG_ESTOP_CLEAR`) or hardware. |
+| NORMAL | RC drives the tracks **and** flippers simultaneously (the fixed scheme below). Workstation arm-joint commands are relayed concurrently. |
+| ESTOP | All outputs neutralized; cleared by the PC (`MSG_ESTOP_CLEAR`) or by returning the Ch6 lever to centre. |
 
-The **Ch5 3-position lever** selects which mode/keybind row is active. Mode
-selection and an e-stop channel are decoded from PPM on the ESP32.
+### 13.2 RC control scheme (fixed)
 
-### 13.2 Keybind system
+There is **no operator-editable keybind table** anymore (the old `ChannelFunction`
+table + `MSG_KEYBIND` were removed). The RC uses one **fixed** mapping, hardcoded
+in the firmware (`firmware/ESP/lib/Control/Control.cpp`, channel roles in
+`config.h`). Drive + flippers are always live together; the **arm is driven from
+the workstation gamepad** (`joystick_servo`), not the RC.
 
-`Ch5` (3 positions) chooses one of **3 rows**; each row assigns a
-`ChannelFunction` to **5 channel slots** (Ch1, Ch2, Ch3, Ch4, Ch6). Functions:
-`NONE, TRACTION_FWD, TRACTION_TURN, FLIPPER_ALL, FLIPPER_FL/FR/RL/RR, ESTOP,
-ARM_X/Y/Z/PITCH/YAW/ROLL, GRIPPER`. The table is editable in the GUI and pushed
-as `MSG_KEYBIND` (0x14). The **workstation `rc_servo` decodes the same table**
-to know which stick drives which arm axis in ARM mode.
+| Channel | Type | Role |
+|---------|------|------|
+| **Ch3** | stick | traction forward / back |
+| **Ch4** | stick | traction turn |
+| **Ch2** | stick | flipper **rate** — drives whichever flipper(s) Ch1+Ch5 select (stick = rate, holds where released; loop closed on the VESC) |
+| **Ch1** | stick → 3-way | flipper **L/R selector**: below −deadband = left only, within deadband = **both**, above +deadband = right only |
+| **Ch5** | 2-state lever | flipper **pair**: min = **front** (FL/FR), max = **rear** (RL/RR) |
+| **Ch6** | 3-position lever | **down = E-STOP**, centre = normal, **up = virtual-flip** |
+
+So at any time Ch1+Ch5 pick one flipper (or a left/right pair) and Ch2 moves it;
+flip Ch5 to switch to the other end, nudge Ch1 to isolate a side.
+
+**Virtual flip (Ch6 up)** — "drive from the other end". The robot is symmetric, so
+to back out of a dead-end hallway without turning around, Ch6-up does a full 180°
+remap of the control frame: traction forward is negated (steering is left as-is —
+negating forward already produces correct reverse-drive turning, so inverting
+turn too would double-flip it), the Ch5 front/rear pair selection swaps, and the
+Ch1 left/right flipper selection mirrors (operator-left = robot-right). Each piece
+is a bench-tunable sign (`VFLIP_*` in `config.h`). The active state is reported to
+the GUI in the telemetry flags (bit4), shown as **"REVERSE"** in the odometry
+panel.
+
+**E-stop (Ch6 down)** is level-based: hold the lever down to stop, return it to
+centre to resume (unless a software e-stop is also active). See §16.
 
 ### 13.3 The two control loops
 
@@ -733,17 +791,18 @@ operator stick → RC TX → 2.4 GHz → FS-iA6B → PPM → ESP32
                                           ↑ VESC closes the position loop + reports the angle
 ```
 
-**Arm (closed through the network, operator-in-the-loop):**
+**Arm (closed through the network, operator-in-the-loop):** the arm is **not** on
+the RC anymore — it is driven by the workstation gamepad:
 ```
-operator stick → ... → ESP32 → (USB serial telemetry, raw PPM)
-  → Jetson esp32_bridge → /robot/ppm → (network) → workstation
-  → rc_servo → TwistStamped → MoveIt Servo (IK) → /arm/joint_command
+operator gamepad → joystick_servo → TwistStamped → SDLS servo (IK) → /joint_states
   → (network) → Jetson esp32_bridge → MSG_ARM_JOINTS → (serial) → ESP32
-  → arm CAN relay → ODrive/ZE300/LKTech → joints
+  → arm CAN relay → ODrive/ZE300/LKTech → joints   (gated by the arm lifecycle)
 ```
-If the network link drops, the arm freezes (no new joint commands) but the base
-still responds to RC. If the **RC** link drops, the tracks stop and the
-**flippers hold their angle** (they are never driven home).
+The ESP relays these joint commands continuously (concurrent with RC drive/
+flippers); the arm only moves once it has been **armed** (§16). If the network
+link drops, the arm freezes (no new joint commands) but the base still responds
+to RC. If the **RC** link drops, the tracks stop and the **flippers hold their
+angle** (they are never driven home).
 
 ---
 
@@ -761,8 +820,11 @@ still responds to RC. If the **RC** link drops, the tracks stop and the
   (RPLidar) transform feeds `slam_toolbox` for `map → odom`. The wheel-odometry
   publisher deliberately does **not** emit a TF (the EKF does).
 
-The digital twin in the GUI consumes the arm URDF + `/arm/joint_command` (or
-`/joint_states`) to render the live pose.
+The digital twin in the GUI consumes the **combined** robot URDF
+(`arm_description/dicerox_full.urdf` — arm + chassis + flippers) on
+`/robot_description` and renders the live pose from `/joint_states`: the arm
+joints from `servo_node`, the flipper joints from `arm_teleop/flipper_state`
+(which maps `/encoders/flipper` → the URDF's `Flipper1J..Flipper4J`).
 
 ---
 
@@ -770,8 +832,8 @@ The digital twin in the GUI consumes the arm URDF + `/arm/joint_command` (or
 
 - Jetson and workstation are on the **same ROS 2 / DDS domain** over
   Wi-Fi/Ethernet. No micro-ROS; the only serial link is ESP32↔Jetson.
-- Large/continuous data (thermal image) uses appropriate QoS; config/keybind/
-  calibration use **reliable + transient-local** so a late-joining GUI or
+- Large/continuous data (thermal image) uses appropriate QoS; config/PPM
+  calibration uses **reliable + transient-local** so a late-joining GUI or
   bridge still receives the latest value.
 - **Bulk media does not use DDS.** The RF *driving* cameras are local webcams at
   the workstation; the C920 *inspection* cameras stream H.264 (+ Opus audio) over
@@ -785,14 +847,48 @@ The digital twin in the GUI consumes the arm URDF + `/arm/joint_command` (or
 
 ## 16. Safety & e-stop
 
-- **Hardware/RC e-stop:** a dedicated PPM channel can trigger `ESTOP` on the
-  ESP32 directly (independent of the network).
+- **RC e-stop (Ch6 down):** Ch6 is a 3-position lever — its **down** third
+  triggers `ESTOP` directly on the chassis ESP32; centre = normal, up =
+  virtual-flip (§13.2). Level-based: returning the lever to centre resumes the
+  chassis (unless a software e-stop is also latched). **Safety tradeoff for this
+  revision:** the arm PCB does not have a direct RC/e-stop wire. The Jetson bridge
+  mirrors chassis e-stop transitions to the arm ESP32 over the second USB serial
+  link (`MSG_ESTOP` / `MSG_ESTOP_CLEAR`).
 - **Software e-stop:** the GUI publishes `/robot/estop` (republished ~10 Hz);
-  the bridge sends `MSG_ESTOP` / `MSG_ESTOP_CLEAR`. ESTOP neutralizes all motor
-  outputs; recovery requires an explicit clear.
+  the bridge broadcasts `MSG_ESTOP` / `MSG_ESTOP_CLEAR` to all discovered ESP32
+  links. ESTOP neutralizes the **base** outputs (tracks stop, flippers hold) and
+  **holds** the arm; recovery requires an explicit clear.
+- **Arm e-stop = HOLD, not limp (`ARM_ESTOP_HOLD = 1`, default):** an e-stop on
+  an *armed* arm freezes every joint at its last commanded pose with the motors
+  **still energized**, so the (heavy, gravity-loaded) arm stays put instead of
+  dropping. The arm control tick re-issues the hold every loop while in ESTOP, new
+  joint commands are ignored, and clearing the e-stop resumes motion **in place**
+  with no re-arm (the firmware ramp eases from the hold pose to the live target).
+  In **Chassis mode** the wrist (J5/J6) is already torque-off, so the hold leaves
+  it off. With `ARM_ESTOP_HOLD = 0` (legacy) e-stop instead de-energizes every
+  joint and drops to UNINIT (the arm droops and needs a fresh **arm**). A latched
+  **CAN fault** always de-energizes regardless of this flag.
 - **RC failsafe:** if no valid PPM frame arrives within the timeout
   (`PPM_TIMEOUT_MS`), the tracks stop and the flippers **hold** their angle.
-  A hard e-stop coasts the flippers (or holds, per `FLIPPER_ESTOP_HOLD`).
+  An e-stop (hardware **or** the GUI software stop) also **holds** the flippers
+  in place by default (`FLIPPER_ESTOP_HOLD = 1`): both paths run
+  `Locomotion::estopOutputs()`, which keeps the VESC position loop closed at the
+  last commanded target. Note the active fake-RPM lisp path (`FLIPPER_USE_LEGACY_
+  RPM_LISP`) has **no coast bit** — setting `FLIPPER_ESTOP_HOLD = 0` there drives
+  the flippers to *angle 0* instead of free-wheeling, so leave it at `1` to hold.
+- **Arm lifecycle (passive boot):** the arm boots **disarmed** (`ARM_PASSIVE_BOOT`)
+  — the CAN HAL comes up but no motor is enabled, no zero is captured, and joint
+  commands are ignored until the operator **arms** it. The Jetson bridge exposes
+  this as `std_srvs/Trigger` services `/arm/arm`, `/arm/disarm`,
+  `/arm/mode/dexterity`, `/arm/mode/chassis`, and latches the state on
+  `/arm/state` (UNINIT/INITIALIZING/READY/FAULT), `/arm/fault`,
+  `/arm/can_presence` (per-joint init bitmask), `/arm/operating_mode` and
+  `/arm/joint_active_mask`. The GUI dashboard surfaces all of this (state LED,
+  CAN-presence dots, Arm/Disarm + a Dexterity⇄Chassis toggle) and offers a
+  one-shot **"arm now?"** prompt at startup when it finds the arm disarmed.
+  **Chassis mode** torque-offs the wrist (J5/J6) so they don't overheat while the
+  arm is parked. A latched CAN fault disarms the arm and rejects motion until a
+  fresh arm; the SDLS servo holds (publishes nothing) while faulted/disarmed.
 - **Bring-up discipline:** confirm CAN bitrate (500 kbps everywhere), VESC/arm
   IDs, gear ratios, and direction signs **before** powered motion. Start motor
   tests with small commands. Re-check ODrive/LKTech/ZE300 zero offsets after
@@ -811,10 +907,12 @@ pio run -t upload  # flash
 pio device monitor # serial monitor
 ```
 
-Edit `include/config.h` for pins, CAN IDs, gear ratios, and flipper params. There
-is **no robot-variant switch** — one robot, one build. The flipper VESCs also need
-`firmware/VESC/flipper_position.lisp` flashed via VESC Tool (Scripting → LispBM,
-"Run at startup") — see `firmware/VESC/README.md`.
+Edit `include/config.h` for pins, CAN IDs, gear ratios, flipper params, and the
+single per-board role macro. Leave `ROBOCOREA_BOARD_ROLE` at
+`ROBOCOREA_BOARD_ROLE_CHASSIS` for the chassis PCB; set it to
+`ROBOCOREA_BOARD_ROLE_ARM` for the arm PCB before building/flashing that board.
+The flipper VESCs also need `firmware/VESC/flipper_position.lisp` flashed via
+VESC Tool (Scripting → LispBM, "Run at startup") — see `firmware/VESC/README.md`.
 
 ### ROS 2 workspace (Jetson and workstation)
 
@@ -827,17 +925,19 @@ source install/setup.bash
 
 **On the Jetson** launch the relay + sensors + the C920 video/audio streamer:
 ```bash
-ros2 launch esp32_bridge esp32_bridge.launch.py serial_port:=/dev/ttyUSB0 baud_rate:=921600
+ros2 launch esp32_bridge esp32_bridge.launch.py
+# Optional explicit bench override:
+# ros2 launch esp32_bridge esp32_bridge.launch.py serial_port:=/dev/serial/by-id/usb-...
 ros2 launch thermal_camera thermal.launch.py
 ./software/ros2_ws/src/gui/scripts/c920_srt_stream.sh   # C920 H.264 (+Opus) → SRT; edit devices/ports at top
 # (future) ros2 launch rescue_nav slam.launch.py
 ```
 
-**On the workstation** launch the operator stack:
+**On the workstation** launch the operator stack in one shot (GUI + SDLS servo +
+flipper_state + digital twin; add `joystick:=true` for gamepad arm teleop):
 ```bash
-ros2 launch gui gui.launch.py            # GUI + vision
-ros2 launch arm_moveit servo.launch.py   # MoveIt Servo
-ros2 launch arm_teleop rc_arm.launch.py  # rc_servo + joint relay
+ros2 launch gui bringup.launch.py                 # GUI + twin + servo
+ros2 launch gui bringup.launch.py joystick:=true  # + gamepad arm teleop
 ```
 
 Per-host convenience scripts should live in `rescue_bringup` (cf. legacy

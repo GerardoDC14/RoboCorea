@@ -59,14 +59,24 @@ static void sensorTask(void*) {
 static void commsTask(void*) {
     const TickType_t telem_period = pdMS_TO_TICKS(1000 / CONTROL_LOOP_HZ);  // 50 Hz
     TickType_t last = xTaskGetTickCount();
+    uint32_t last_identity_ms = 0;
+    bool identity_sent = false;
     uint8_t status_div = 0;
 
     for (;;) {
         Comms::tick();   // drain RX, dispatch callbacks
 
+        uint32_t now_ms = millis();
+        if (!identity_sent || now_ms - last_identity_ms >= 1000) {
+            identity_sent = true;
+            last_identity_ms = now_ms;
+            Comms::sendBoardIdentity();
+        }
+
         if (xTaskGetTickCount() - last >= telem_period) {
             last = xTaskGetTickCount();
 
+#if ROBOCOREA_ROLE_IS_CHASSIS
             SystemStatus status;
             Control::getSystemStatus(status);
 
@@ -83,7 +93,8 @@ static void commsTask(void*) {
             t.flags = (status.ppm_connected ? 0x01 : 0)
                     | (status.sensor_mask   ? 0x02 : 0)
                     | (status.can_ok        ? 0x04 : 0)
-                    | (status.estop         ? 0x08 : 0);
+                    | (status.estop         ? 0x08 : 0)
+                    | (status.virtual_flip  ? 0x10 : 0);
             for (int i = 0; i < PPM_CHANNELS; i++) t.ppm[i] = ppm.valid ? ppm.ch[i] : 0;
             t.speed_left    = (int16_t)(spd_l * 10.0f);
             t.speed_right   = (int16_t)(spd_r * 10.0f);
@@ -93,13 +104,10 @@ static void commsTask(void*) {
 
             Comms::sendEncoderExt(flip[0], flip[1], flip[2], flip[3]);
 
-            // ── System status + arm lifecycle (lower rate, 10 Hz) ──────────
+            // ── System status (lower rate, 10 Hz) ──────────────────────────
             if (++status_div >= 5) {
                 status_div = 0;
                 Comms::sendStatus(status);
-                ArmLifecyclePayload al;
-                CANInterface::getArmLifecycle(al);
-                Comms::sendArmLifecycle(al);
             }
 
             // ── Sensors (only what's enabled and freshly valid) ────────────
@@ -111,6 +119,15 @@ static void commsTask(void*) {
                 uint8_t id = CANInterface::vescIdByIndex(idx);
                 VescStatusPayload v;
                 if (id && CANInterface::getVescStatus(id, v)) Comms::sendVescStatus(v);
+            }
+#endif
+
+#if ROBOCOREA_ROLE_IS_ARM
+            if (++status_div >= 5) {
+                status_div = 0;
+                ArmLifecyclePayload al;
+                CANInterface::getArmLifecycle(al);
+                Comms::sendArmLifecycle(al);
             }
             for (uint8_t j = 0; j < ODRIVE_NUM_JOINTS; j++) {
                 OdriveStatusPayload o;
@@ -125,6 +142,7 @@ static void commsTask(void*) {
                 OdriveErrorPayload e;
                 if (CANInterface::getOdriveError(n, e)) Comms::sendOdriveError(e);
             }
+#endif
         }
 
         vTaskDelay(pdMS_TO_TICKS(1));
@@ -133,11 +151,17 @@ static void commsTask(void*) {
 
 void setup() {
     Comms::begin();          // UART + TX mutex
+#if ROBOCOREA_ROLE_IS_CHASSIS
     Sensors::begin();        // I2C: LIS3MDL magnetometer
+#endif
     CANInterface::begin();   // TWAI + arm controller bring-up (blocking)
+#if ROBOCOREA_ROLE_IS_CHASSIS
     Locomotion::begin();     // zero the drivetrain VESCs
+#endif
     Control::begin();        // register callbacks, configure flipper PIDs
+#if ROBOCOREA_ROLE_IS_CHASSIS
     RC::begin(PIN_PPM);      // attach the PPM ISR
+#endif
 
     xTaskCreatePinnedToCore(controlTask, "control", STACK_CONTROL, nullptr,
                             PRIO_CONTROL, nullptr, TASK_CORE_CONTROL);
@@ -145,8 +169,10 @@ void setup() {
                             PRIO_COMMS,   nullptr, TASK_CORE_COMMS);
     xTaskCreatePinnedToCore(canTask,     "can",     STACK_CAN,     nullptr,
                             PRIO_CAN,     nullptr, TASK_CORE_CAN);
+#if ROBOCOREA_ROLE_IS_CHASSIS
     xTaskCreatePinnedToCore(sensorTask,  "sensor",  STACK_SENSORS, nullptr,
                             PRIO_SENSORS, nullptr, TASK_CORE_SENSORS);
+#endif
 }
 
 void loop() {

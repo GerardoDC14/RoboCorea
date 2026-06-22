@@ -1,65 +1,23 @@
 """
 RoboCorea ESP32 ⇄ ROS 2 bridge (Jetson side)
 =============================================
-Runs on the Jetson Orin Nano. Owns the USB-serial link to the ESP32, decodes the
-binary protocol into ROS 2 topics, and serializes inbound topics back into frames.
+Runs on the Jetson Orin Nano. Owns one or two USB-serial links to identical
+ESP32 PCBs and routes frames by the board identity announced by firmware:
 
-Binary frame: [0xAA][0x55][TYPE:1][LEN_H:1][LEN_L:1][PAYLOAD:LEN][CRC:1]
-              CRC = XOR of TYPE ^ LEN_H ^ LEN_L ^ all payload bytes.
-The struct formats below MUST stay byte-identical to firmware include/robot_types.h.
+  * CHASSIS PCB: RC/PPM, traction, flippers, wheel odometry, magnetometer.
+  * ARM PCB: arm lifecycle, joint commands, and mixed-CAN arm telemetry.
 
-Published (ESP32 → PC)
-──────────────────────
-/robot/telemetry      std_msgs/Float32MultiArray  [spd_l_rpm, spd_r_rpm, flipper_deg, uptime_s]
-/robot/mode           std_msgs/String             INIT/STANDBY/NORMAL/ARM/ESTOP/FLIPPER
-/robot/flags          std_msgs/UInt8              bit0 ppm, bit1 sensors, bit2 can, bit3 estop
-/robot/ppm            std_msgs/Int16MultiArray    raw PPM µs [ch1..ch6]
-/robot/status         diagnostic_msgs/DiagnosticArray
-/robot/deadband       std_msgs/Float32            normalised RC deadband (echoed from calib)
-/encoders/tracks      geometry_msgs/Vector3       x=left_rpm, y=right_rpm (live track speed)
-/encoders/flipper     std_msgs/Float32MultiArray  [fl, fr, rl, rr] degrees
-/odom/wheel           nav_msgs/Odometry           track odometry from the traction VESC tachometers
-/sensors/mag          sensor_msgs/MagneticField   LIS3MDL XYZ
-/motors/vesc_status   std_msgs/Float32MultiArray  [id, erpm, current_A, duty, t_fet, t_mot, v_in, tacho]
-/motors/odrive_status std_msgs/Float32MultiArray  [joint, pos_turns, vel_turns_s, iq_A, bus_V, bus_A]
-/motors/lktech_status std_msgs/Float32MultiArray  [joint, motor_id, temp_C, iq_A, dps, angle, out_deg]
-/motors/ze300_status  std_msgs/Float32MultiArray  [id, temp_C, iq_A, rpm, single_turn, pos_counts, out_deg]
-/motors/odrive_error  std_msgs/Float32MultiArray  [node_id, motor_error]
-/gripper              std_msgs/Float32            normalised gripper command from RC
-/arm/operating_mode   std_msgs/String             DEXTERITY or CHASSIS
-/arm/joint_active_mask std_msgs/UInt8              bits 0..5 indicate active position control
-
-Subscribed (PC → ESP32)
-───────────────────────
-/robot/estop          std_msgs/Bool               True = ESTOP, False = ESTOP_CLEAR
-/joint_states         sensor_msgs/JointState      arm joint positions (rad) → MSG_ARM_JOINTS
-/sensors/enable_mask  std_msgs/UInt8              bit0 mag (thermal/gas/imu bits unused here)
-/robot/keybind        std_msgs/UInt8MultiArray    15 bytes (3 modes × 5 channels)
-/robot/ppm_calib      std_msgs/UInt16MultiArray   19 values (6ch × min/neu/max + deadband)
-
-Parameters
-──────────
-serial_port (str)  /dev/ttyUSB0
-baud_rate   (int)  921600
-joint_names (str[]) URDF joint names in J1..J6 order (for /joint_states mapping)
-joint_command_signs (float[]) URDF radians → firmware physical-degree signs
-
-Track odometry (VESC tachometer → /odom/wheel). The two traction VESC tachometers
-are converted to per-track distance and integrated into a 2D wheel-odometry pose.
-This feeds the (deferred) robot_localization EKF that fuses it with the ZED2; it is
-published WITHOUT a TF — the EKF owns odom→base_link. The covariances deliberately
-down-weight yaw (a skid-steer tracked robot's wheel heading is unreliable under
-track slip). Measure/confirm these on the robot:
-  traction_id_left / traction_id_right (int)   VESC CAN ids (config.h: 60 / 50)
-  traction_dir_left / traction_dir_right (float) tacho sign (match config.h TRACTION_DIR_*)
-  wheel_circumference_m (float)  track sprocket effective circumference  [MEASURE]
-  track_width_m (float)          lateral distance between the two tracks  [MEASURE]
-  motor_pole_pairs (int)         VESC motor pole pairs (config.h: 7)
-  gear_ratio (float)             motor→output reduction (config.h: 100)
-  tacho_steps_per_erev (float)   VESC tachometer steps per electrical rev (6; confirm vs VESC fw)
+The public ROS API intentionally stays the same as the old one-PCB bridge:
+chassis data appears on /robot, /encoders, /odom, /sensors, and /motors/vesc_*;
+arm data appears on /arm and the arm motor topics.
 """
 
+from __future__ import annotations
+
+import ast
+import glob
 import math
+import os
 import struct
 import threading
 import time
@@ -72,7 +30,7 @@ import serial
 
 from std_msgs.msg import (
     Bool, String, UInt8, UInt16, Float32, Float32MultiArray,
-    Int16MultiArray, UInt8MultiArray, UInt16MultiArray,
+    Int16MultiArray, UInt16MultiArray,
 )
 from sensor_msgs.msg import MagneticField, JointState
 from nav_msgs.msg import Odometry
@@ -80,47 +38,167 @@ from geometry_msgs.msg import Vector3
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from std_srvs.srv import Trigger
 
-# ─── Protocol IDs (must match config.h) ──────────────────────────────────────
-MSG_TELEMETRY    = 0x01
-MSG_MAG          = 0x03
-MSG_STATUS       = 0x05
-# 0x06 (MSG_SENSOR_IMU) reserved/unused — no IMU on the ESP32; orientation is from the ZED2.
-MSG_ENCODER_EXT  = 0x07
-MSG_VESC_STATUS  = 0x08
-MSG_ODRIVE_STATUS = 0x0A
-MSG_LKTECH_STATUS = 0x0B
-MSG_ZE300_STATUS  = 0x0C
-MSG_ODRIVE_ERROR  = 0x0D
-MSG_ARM_LIFECYCLE = 0x0E
-MSG_GRIPPER       = 0x16
+from .protocol import (
+    ROLE_ARM,
+    ROLE_CHASSIS,
+    ROLE_NAMES,
+    MSG_ARM_DISARM,
+    MSG_ARM_INIT,
+    MSG_ARM_JOINTS,
+    MSG_ARM_LIFECYCLE,
+    MSG_ARM_MODE,
+    MSG_BOARD_IDENTITY,
+    MSG_ENCODER_EXT,
+    MSG_ESTOP,
+    MSG_ESTOP_CLEAR,
+    MSG_GRIPPER,
+    MSG_LKTECH_STATUS,
+    MSG_MAG,
+    MSG_ODRIVE_ERROR,
+    MSG_ODRIVE_STATUS,
+    MSG_PPM_CALIB,
+    MSG_SENSOR_ENABLE,
+    MSG_STATUS,
+    MSG_TELEMETRY,
+    MSG_VESC_STATUS,
+    MSG_ZE300_STATUS,
+    ChassisEstopMirror,
+    FrameParser,
+    RoleRouteTable,
+    build_frame,
+    parse_identity,
+)
 
-MSG_ARM_JOINTS    = 0x10
-MSG_SENSOR_ENABLE = 0x11
-MSG_ESTOP         = 0x12
-MSG_ESTOP_CLEAR   = 0x13
-MSG_KEYBIND       = 0x14
-MSG_PPM_CALIB     = 0x15
-MSG_ARM_INIT      = 0x17
-MSG_ARM_DISARM    = 0x18
-MSG_ARM_MODE      = 0x19
-
-# Arm lifecycle state codes (match firmware ArmState)
 ARM_STATE_NAMES = {0: 'UNINIT', 1: 'INITIALIZING', 2: 'READY', 3: 'FAULT'}
 ARM_MODE_NAMES = {0: 'DEXTERITY', 1: 'CHASSIS'}
-
 MODE_NAMES = {0: 'INIT', 1: 'STANDBY', 2: 'NORMAL', 3: 'ARM', 4: 'ESTOP', 5: 'FLIPPER'}
 
 PPM_CHANNELS = 6
-MAX_PAYLOAD_LEN = 2048   # any larger "length" is a false SOF match → resync
 
 
-def _build_frame(msg_type: int, payload: bytes) -> bytes:
-    len_h = (len(payload) >> 8) & 0xFF
-    len_l = len(payload) & 0xFF
-    crc = msg_type ^ len_h ^ len_l
-    for b in payload:
-        crc ^= b
-    return bytes([0xAA, 0x55, msg_type, len_h, len_l]) + payload + bytes([crc])
+def _normalise_candidates(value) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    text = '' if value is None else str(value).strip()
+    if not text:
+        return []
+    if text.startswith('['):
+        try:
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, (list, tuple)):
+                return [str(v).strip() for v in parsed if str(v).strip()]
+        except (SyntaxError, ValueError):
+            pass
+    return [part.strip() for part in text.split(',') if part.strip()]
+
+
+class SerialLink:
+    """One candidate serial device, read on a background thread."""
+
+    def __init__(self, node: 'ESP32BridgeNode', path: str, realpath: str,
+                 baud_rate: int, reconnect_period: float):
+        self.node = node
+        self.path = path
+        self.realpath = realpath
+        self.baud_rate = baud_rate
+        self.reconnect_period = reconnect_period
+        self.parser = FrameParser()
+        self.role: int | None = None
+        self.identity = None
+        self.last_rx_monotonic = 0.0
+        self._ser = None
+        self._serial_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name=f'esp32:{os.path.basename(path)}', daemon=True)
+        self._last_open_warn = 0.0
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._drop_serial()
+
+    def join(self, timeout: float = 1.0):
+        self._thread.join(timeout=timeout)
+
+    def send(self, frame: bytes) -> bool:
+        bad_serial = False
+        with self._serial_lock:
+            ser = self._ser
+            if ser is None:
+                return False
+            try:
+                ser.write(frame)
+                return True
+            except (serial.SerialException, OSError) as e:
+                bad_serial = True
+                self.node.get_logger().error(f'{self.path} write error: {e}; reconnecting')
+        if bad_serial:
+            self._drop_serial()
+        return False
+
+    def _open_serial(self) -> bool:
+        try:
+            # exclusive=True (POSIX flock) refuses a second open of the same
+            # device, a backstop against a stale link and a fresh one briefly
+            # racing for the same port across a USB re-enumeration.
+            ser = serial.Serial(self.path, self.baud_rate, timeout=0.1, exclusive=True)
+            try:
+                ser.reset_input_buffer()
+            except Exception:
+                pass
+            with self._serial_lock:
+                self._ser = ser
+            self.parser.reset()
+            self.node.get_logger().info(f'Opened ESP candidate {self.path} @ {self.baud_rate}')
+            return True
+        except (serial.SerialException, OSError) as e:
+            now = time.monotonic()
+            if now - self._last_open_warn >= 10.0:
+                self._last_open_warn = now
+                self.node.get_logger().warn(
+                    f'{self.path} unavailable ({e}); retry in {self.reconnect_period:.0f}s')
+            return False
+
+    def _drop_serial(self):
+        with self._serial_lock:
+            ser = self._ser
+            self._ser = None
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+    def _read(self, size: int) -> bytes:
+        with self._serial_lock:
+            ser = self._ser
+        if ser is None:
+            return b''
+        return ser.read(size)
+
+    def _run(self):
+        while rclpy.ok() and not self._stop.is_set():
+            with self._serial_lock:
+                opened = self._ser is not None
+            if not opened:
+                if not self._open_serial():
+                    self._stop.wait(self.reconnect_period)
+                    continue
+
+            try:
+                raw = self._read(256)
+            except (serial.SerialException, OSError) as e:
+                self.node.get_logger().error(f'{self.path} read error: {e}; reconnecting')
+                self._drop_serial()
+                continue
+            if not raw:
+                continue
+
+            self.last_rx_monotonic = time.monotonic()
+            for msg_type, payload in self.parser.feed(raw):
+                self.node._on_serial_frame(self, msg_type, payload)
 
 
 class ESP32BridgeNode(Node):
@@ -128,41 +206,38 @@ class ESP32BridgeNode(Node):
     def __init__(self):
         super().__init__('esp32_bridge')
 
-        self.declare_parameter('serial_port', '/dev/ttyUSB0')
+        self.declare_parameter('serial_port', '')
+        self.declare_parameter('serial_candidates', '/dev/serial/by-id/*,/dev/serial/by-path/*')
         self.declare_parameter('baud_rate', 921600)
         self.declare_parameter('reconnect_period', 3.0)
-        # Must match the names the arm servo publishes on /joint_states and the
-        # URDF (arm_teleop / dicerox_arm.urdf uses capitalized Joint1..Joint6).
+        self.declare_parameter('discovery_period', 2.0)
         self.declare_parameter(
             'joint_names',
             ['Joint1', 'Joint2', 'Joint3', 'Joint4', 'Joint5', 'Joint6'])
-        # Match the working Dicerox bridge convention: MoveIt/URDF joint radians
-        # are converted to the firmware's physical joint-degree frame before the
-        # ESP32 applies its per-motor gear/direction mapping.
         self.declare_parameter('joint_command_signs', [-1.0, -1.0, -1.0, -1.0, -1.0, 1.0])
 
-        self._serial_port = self.get_parameter('serial_port').value
+        self._serial_port = str(self.get_parameter('serial_port').value or '')
+        self._serial_candidates = self.get_parameter('serial_candidates').value
         self._baud_rate = int(self.get_parameter('baud_rate').value)
         self._reconnect_period = float(self.get_parameter('reconnect_period').value)
+        self._discovery_period = float(self.get_parameter('discovery_period').value)
         self._joint_names = list(self.get_parameter('joint_names').value)
         self._joint_command_signs = [float(v) for v in self.get_parameter('joint_command_signs').value]
         if len(self._joint_command_signs) != 6:
             self.get_logger().warn(
                 f'joint_command_signs must have 6 values, got {len(self._joint_command_signs)}; using defaults')
             self._joint_command_signs = [-1.0, -1.0, -1.0, -1.0, -1.0, 1.0]
-        self._ser = None
 
-        # ── Track (wheel) odometry from the VESC tachometers ──────────────────
-        # Defaults match config.h; the geometry values MUST be measured on the robot.
+        # Track odometry parameters.
         self.declare_parameter('traction_id_left', 60)
         self.declare_parameter('traction_id_right', 50)
         self.declare_parameter('traction_dir_left', 1.0)
         self.declare_parameter('traction_dir_right', 1.0)
-        self.declare_parameter('wheel_circumference_m', 0.5)   # TODO: measure sprocket effective circumference
-        self.declare_parameter('track_width_m', 0.4)           # TODO: measure track centre-to-centre
+        self.declare_parameter('wheel_circumference_m', 0.5)
+        self.declare_parameter('track_width_m', 0.4)
         self.declare_parameter('motor_pole_pairs', 7)
         self.declare_parameter('gear_ratio', 100.0)
-        self.declare_parameter('tacho_steps_per_erev', 6.0)    # VESC commutation steps/erev (confirm vs VESC fw)
+        self.declare_parameter('tacho_steps_per_erev', 6.0)
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('odom_child_frame', 'base_link')
         self.declare_parameter('odom_rate_hz', 50.0)
@@ -180,10 +255,9 @@ class ESP32BridgeNode(Node):
         self._odom_child_frame = str(self.get_parameter('odom_child_frame').value)
         self._odom_rate_hz = float(self.get_parameter('odom_rate_hz').value)
 
-        # Wheel-odometry integrator state.
-        self._track_dist = {'L': None, 'R': None}   # per-side distance (m), relative to first reading
-        self._track_zero = {'L': None, 'R': None}   # first cumulative reading (m), subtracted out
-        self._odom_last = {'L': 0.0, 'R': 0.0}       # last integrated per-side distance (m)
+        self._track_dist = {'L': None, 'R': None}
+        self._track_zero = {'L': None, 'R': None}
+        self._odom_last = {'L': 0.0, 'R': 0.0}
         self._odom_x = 0.0
         self._odom_y = 0.0
         self._odom_yaw = 0.0
@@ -198,148 +272,232 @@ class ESP32BridgeNode(Node):
 
         # Publishers
         self._pub_telemetry = self.create_publisher(Float32MultiArray, '/robot/telemetry', sensor_qos)
-        self._pub_mode      = self.create_publisher(String,            '/robot/mode',      sensor_qos)
-        self._pub_flags     = self.create_publisher(UInt8,             '/robot/flags',     sensor_qos)
-        self._pub_ppm       = self.create_publisher(Int16MultiArray,   '/robot/ppm',       sensor_qos)
-        self._pub_status    = self.create_publisher(DiagnosticArray,   '/robot/status',    sensor_qos)
-        self._pub_deadband  = self.create_publisher(Float32,           '/robot/deadband',  latched_qos)
-        self._pub_tracks    = self.create_publisher(Vector3,           '/encoders/tracks', sensor_qos)
-        self._pub_flipper   = self.create_publisher(Float32MultiArray, '/encoders/flipper', sensor_qos)
-        self._pub_wheel_odom = self.create_publisher(Odometry,         '/odom/wheel',      sensor_qos)
-        self._pub_mag       = self.create_publisher(MagneticField,     '/sensors/mag',     sensor_qos)
-        self._pub_vesc      = self.create_publisher(Float32MultiArray, '/motors/vesc_status',   sensor_qos)
-        self._pub_odrive    = self.create_publisher(Float32MultiArray, '/motors/odrive_status', sensor_qos)
-        self._pub_lktech    = self.create_publisher(Float32MultiArray, '/motors/lktech_status', sensor_qos)
-        self._pub_ze300     = self.create_publisher(Float32MultiArray, '/motors/ze300_status',  sensor_qos)
-        self._pub_odrv_err  = self.create_publisher(Float32MultiArray, '/motors/odrive_error',  sensor_qos)
-        self._pub_gripper   = self.create_publisher(Float32,           '/gripper',         sensor_qos)
-        # Arm safety lifecycle (latched so a late-joining GUI/servo sees current state)
-        self._pub_arm_state = self.create_publisher(String,            '/arm/state',       latched_qos)
-        self._pub_arm_fault = self.create_publisher(Bool,              '/arm/fault',       latched_qos)
-        self._pub_arm_presence = self.create_publisher(UInt16,          '/arm/can_presence', latched_qos)
+        self._pub_mode = self.create_publisher(String, '/robot/mode', sensor_qos)
+        self._pub_flags = self.create_publisher(UInt8, '/robot/flags', sensor_qos)
+        self._pub_ppm = self.create_publisher(Int16MultiArray, '/robot/ppm', sensor_qos)
+        self._pub_status = self.create_publisher(DiagnosticArray, '/robot/status', sensor_qos)
+        self._pub_deadband = self.create_publisher(Float32, '/robot/deadband', latched_qos)
+        self._pub_tracks = self.create_publisher(Vector3, '/encoders/tracks', sensor_qos)
+        self._pub_flipper = self.create_publisher(Float32MultiArray, '/encoders/flipper', sensor_qos)
+        self._pub_wheel_odom = self.create_publisher(Odometry, '/odom/wheel', sensor_qos)
+        self._pub_mag = self.create_publisher(MagneticField, '/sensors/mag', sensor_qos)
+        self._pub_vesc = self.create_publisher(Float32MultiArray, '/motors/vesc_status', sensor_qos)
+        self._pub_odrive = self.create_publisher(Float32MultiArray, '/motors/odrive_status', sensor_qos)
+        self._pub_lktech = self.create_publisher(Float32MultiArray, '/motors/lktech_status', sensor_qos)
+        self._pub_ze300 = self.create_publisher(Float32MultiArray, '/motors/ze300_status', sensor_qos)
+        self._pub_odrv_err = self.create_publisher(Float32MultiArray, '/motors/odrive_error', sensor_qos)
+        self._pub_gripper = self.create_publisher(Float32, '/gripper', sensor_qos)
+        self._pub_arm_state = self.create_publisher(String, '/arm/state', latched_qos)
+        self._pub_arm_fault = self.create_publisher(Bool, '/arm/fault', latched_qos)
+        self._pub_arm_presence = self.create_publisher(UInt16, '/arm/can_presence', latched_qos)
         self._pub_arm_mode = self.create_publisher(String, '/arm/operating_mode', latched_qos)
         self._pub_arm_active = self.create_publisher(UInt8, '/arm/joint_active_mask', latched_qos)
         self._last_arm_state = None
         self._last_arm_mode = None
 
-        # Arm arm/disarm services (operator → ESP32 explicit lifecycle commands)
-        self.create_service(Trigger, '/arm/arm',    self._srv_arm)
+        # Services
+        self.create_service(Trigger, '/arm/arm', self._srv_arm)
         self.create_service(Trigger, '/arm/disarm', self._srv_disarm)
         self.create_service(Trigger, '/arm/mode/dexterity', self._srv_dexterity_mode)
         self.create_service(Trigger, '/arm/mode/chassis', self._srv_chassis_mode)
 
         # Subscribers
-        self.create_subscription(Bool,       '/robot/estop',         self._on_estop,         10)
-        self.create_subscription(JointState, '/joint_states',        self._on_joint_states,  10)
-        self.create_subscription(UInt8,      '/sensors/enable_mask', self._on_sensor_enable, 10)
-        self.create_subscription(UInt8MultiArray,  '/robot/keybind',   self._on_keybind,   latched_qos)
+        self.create_subscription(Bool, '/robot/estop', self._on_estop, 10)
+        self.create_subscription(JointState, '/joint_states', self._on_joint_states, 10)
+        self.create_subscription(UInt8, '/sensors/enable_mask', self._on_sensor_enable, 10)
         self.create_subscription(UInt16MultiArray, '/robot/ppm_calib', self._on_ppm_calib, latched_qos)
 
-        # Dispatch table
-        self._handlers = {
-            MSG_TELEMETRY:     self._handle_telemetry,
-            MSG_MAG:           self._handle_mag,
-            MSG_STATUS:        self._handle_status,
-            MSG_ENCODER_EXT:   self._handle_encoder_ext,
-            MSG_VESC_STATUS:   self._handle_vesc_status,
+        self._chassis_handlers = {
+            MSG_TELEMETRY: self._handle_telemetry,
+            MSG_MAG: self._handle_mag,
+            MSG_STATUS: self._handle_status,
+            MSG_ENCODER_EXT: self._handle_encoder_ext,
+            MSG_VESC_STATUS: self._handle_vesc_status,
+            MSG_GRIPPER: self._handle_gripper,
+        }
+        self._arm_handlers = {
             MSG_ODRIVE_STATUS: self._handle_odrive_status,
             MSG_LKTECH_STATUS: self._handle_lktech_status,
-            MSG_ZE300_STATUS:  self._handle_ze300_status,
-            MSG_ODRIVE_ERROR:  self._handle_odrive_error,
+            MSG_ZE300_STATUS: self._handle_ze300_status,
+            MSG_ODRIVE_ERROR: self._handle_odrive_error,
             MSG_ARM_LIFECYCLE: self._handle_arm_lifecycle,
-            MSG_GRIPPER:       self._handle_gripper,
         }
 
-        # Integrate wheel odometry on a fixed-rate timer (decoupled from the async,
-        # per-side arrival of the VESC status frames so dt is stable).
+        self._links_lock = threading.Lock()
+        self._links_by_realpath: dict[str, SerialLink] = {}
+        self._routes = RoleRouteTable()
+        self._estop_mirror = ChassisEstopMirror()
+        self._software_estop_active = None
+        self._last_missing_role_log: dict[tuple[int, str], float] = {}
+        self._last_sensor_mask = 0
+
         rate = self._odom_rate_hz if self._odom_rate_hz > 0.0 else 50.0
         self._odom_timer = self.create_timer(1.0 / rate, self._integrate_wheel_odom)
 
-        self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
-        self._rx_thread.start()
-        self.get_logger().info('RoboCorea ESP32 bridge ready (serial handled asynchronously)')
+        self._discovery_stop = threading.Event()
+        self._discovery_thread = threading.Thread(target=self._discover_loop, name='esp32-discovery', daemon=True)
+        self._discovery_thread.start()
 
-    # ── Serial RX ────────────────────────────────────────────────────────────
-    def _open_serial(self) -> bool:
-        try:
-            self._ser = serial.Serial(self._serial_port, self._baud_rate, timeout=0.1)
+        candidates = ', '.join(self._candidate_patterns())
+        self.get_logger().info(f'RoboCorea ESP32 bridge ready; scanning: {candidates or "(none)"}')
+
+    # Serial discovery and routing.
+    def _candidate_patterns(self) -> list[str]:
+        patterns = _normalise_candidates(self._serial_candidates)
+        if self._serial_port:
+            patterns.insert(0, self._serial_port)
+        return list(dict.fromkeys(patterns))
+
+    def _expand_candidate_paths(self) -> list[str]:
+        out: list[str] = []
+        for pattern in self._candidate_patterns():
+            pattern = os.path.expanduser(pattern)
+            matches = glob.glob(pattern) if glob.has_magic(pattern) else [pattern]
+            for path in matches:
+                if os.path.exists(path):
+                    out.append(path)
+        return sorted(dict.fromkeys(out))
+
+    def _discover_loop(self):
+        while rclpy.ok() and not self._discovery_stop.is_set():
             try:
-                self._ser.reset_input_buffer()
-            except Exception:
-                pass
-            self.get_logger().info(f'Opened {self._serial_port} @ {self._baud_rate}')
-            # Start with all sensors off; the GUI enables them via /sensors/enable_mask.
-            self._send(_build_frame(MSG_SENSOR_ENABLE, bytes([0x00])))
-            return True
-        except (serial.SerialException, OSError) as e:
-            self._ser = None
-            self.get_logger().warn(
-                f'{self._serial_port} unavailable ({e}); retry in {self._reconnect_period:.0f}s')
-            return False
+                self._discover_once()
+            except Exception as e:
+                self.get_logger().error(f'ESP discovery error: {e}')
+            self._discovery_stop.wait(self._discovery_period)
 
-    def _rx_loop(self):
-        state = 'SOF0'
-        msg_type = length = running_crc = 0
-        payload = bytearray()
+    def _discover_once(self):
+        # Resolve the currently-present candidate devices, keyed by realpath so a
+        # device matched by both by-id AND by-path globs yields a single link.
+        live: dict[str, str] = {}
+        for path in self._expand_candidate_paths():
+            live.setdefault(os.path.realpath(path), path)
 
-        while rclpy.ok():
-            if self._ser is None:
-                if not self._open_serial():
-                    time.sleep(self._reconnect_period)
+        reaped: list[SerialLink] = []
+        started: list[tuple[SerialLink, str]] = []
+        with self._links_lock:
+            # Reap links whose device has disappeared (e.g. unplugged, or a USB
+            # re-enumeration moved it to a new /dev/ttyUSB*). Without this the
+            # link map only grows and a re-enumerated board would be opened twice
+            # — once by the stale link (via its stable by-id symlink) and once by
+            # a fresh link keyed on the new realpath — racing for the same port.
+            for realpath, link in list(self._links_by_realpath.items()):
+                if realpath not in live:
+                    del self._links_by_realpath[realpath]
+                    self._routes.clear_link(link)
+                    reaped.append(link)
+            # Start a link for each newly-present device.
+            for realpath, path in live.items():
+                if realpath in self._links_by_realpath:
                     continue
-                state, payload, running_crc = 'SOF0', bytearray(), 0
+                link = SerialLink(self, path, realpath, self._baud_rate, self._reconnect_period)
+                self._links_by_realpath[realpath] = link
+                started.append((link, path))
 
-            try:
-                raw = self._ser.read(256)
-            except (serial.SerialException, OSError) as e:
-                self.get_logger().error(f'Serial read error: {e}; reconnecting')
-                self._close_serial()
-                continue
-            if not raw:
-                continue
+        for link in reaped:
+            link.stop()
+            self.get_logger().info(f'ESP serial candidate {link.path} disappeared; dropped')
+        for link, path in started:
+            link.start()
+            self.get_logger().info(f'Watching ESP serial candidate {path}')
 
-            for byte in raw:
-                if state == 'SOF0':
-                    if byte == 0xAA:
-                        state = 'SOF1'
-                elif state == 'SOF1':
-                    state = 'TYPE' if byte == 0x55 else 'SOF0'
-                elif state == 'TYPE':
-                    msg_type = byte
-                    running_crc = byte
-                    state = 'LEN_H'
-                elif state == 'LEN_H':
-                    length = byte << 8
-                    running_crc ^= byte
-                    state = 'LEN_L'
-                elif state == 'LEN_L':
-                    length |= byte
-                    running_crc ^= byte
-                    payload = bytearray()
-                    if length > MAX_PAYLOAD_LEN:
-                        state = 'SOF0'
-                    else:
-                        state = 'CRC' if length == 0 else 'PAYLOAD'
-                elif state == 'PAYLOAD':
-                    payload.append(byte)
-                    running_crc ^= byte
-                    if len(payload) >= length:
-                        state = 'CRC'
-                elif state == 'CRC':
-                    if byte == running_crc:
-                        self._dispatch(msg_type, bytes(payload))
-                    state = 'SOF0'
+    def _on_serial_frame(self, link: SerialLink, msg_type: int, payload: bytes):
+        if msg_type == MSG_BOARD_IDENTITY:
+            self._handle_identity(link, payload)
+            return
 
-    def _dispatch(self, msg_type: int, payload: bytes):
-        handler = self._handlers.get(msg_type)
+        role = link.role
+        if role is None:
+            return
+        handlers = self._chassis_handlers if role == ROLE_CHASSIS else self._arm_handlers
+        handler = handlers.get(msg_type)
         if handler is None:
             return
         try:
             handler(payload)
         except struct.error as e:
-            self.get_logger().warn(f'Parse error type=0x{msg_type:02X}: {e}')
+            self.get_logger().warn(
+                f'Parse error from {ROLE_NAMES.get(role, role)} {link.path} type=0x{msg_type:02X}: {e}')
 
-    # ── ESP32 → PC handlers ──────────────────────────────────────────────────
+    def _handle_identity(self, link: SerialLink, payload: bytes):
+        try:
+            identity = parse_identity(payload)
+        except struct.error as e:
+            self.get_logger().warn(f'Bad board identity from {link.path}: {e}')
+            return
+        if identity.role not in ROLE_NAMES:
+            self.get_logger().warn(f'{link.path} announced unknown role {identity.role}')
+            return
+
+        with self._links_lock:
+            changed = link.identity != identity
+            previous = self._routes.assign(link, identity)
+            link.role = identity.role
+            link.identity = identity
+
+        if previous is not None and previous is not link:
+            previous.role = None
+            previous.identity = None
+            self.get_logger().warn(
+                f'Replacing {identity.role_name} link {previous.path} with {link.path}')
+        if changed:
+            self.get_logger().info(
+                f'{link.path} identified as {identity.role_name} '
+                f'(protocol={identity.protocol_version}, caps=0x{identity.capabilities:04X})')
+
+        if identity.role == ROLE_CHASSIS:
+            link.send(build_frame(MSG_SENSOR_ENABLE, bytes([self._last_sensor_mask])))
+            if self._software_estop_active:
+                link.send(build_frame(MSG_ESTOP, b''))
+        elif identity.role == ROLE_ARM:
+            if self._software_estop_active or self._estop_mirror.active:
+                link.send(build_frame(MSG_ESTOP, b''))
+
+    def _send_to_role(self, role: int, frame: bytes, reason: str, log_missing: bool = True) -> bool:
+        with self._links_lock:
+            link = self._routes.get(role)
+        if link is not None and link.send(frame):
+            return True
+        if log_missing:
+            self._warn_missing_role(role, reason)
+        return False
+
+    def _broadcast_frame(self, frame: bytes, reason: str) -> bool:
+        with self._links_lock:
+            links = list(self._links_by_realpath.values())
+        sent = False
+        for link in links:
+            sent = link.send(frame) or sent
+        if not sent:
+            now = time.monotonic()
+            key = (-1, reason)
+            if now - self._last_missing_role_log.get(key, 0.0) >= 5.0:
+                self._last_missing_role_log[key] = now
+                self.get_logger().warn(f'No ESP serial links available for {reason}')
+        return sent
+
+    def _warn_missing_role(self, role: int, reason: str):
+        now = time.monotonic()
+        key = (role, reason)
+        if now - self._last_missing_role_log.get(key, 0.0) < 5.0:
+            return
+        self._last_missing_role_log[key] = now
+        self.get_logger().warn(f'Missing {ROLE_NAMES.get(role, role)} ESP link for {reason}')
+
+    def _mirror_chassis_estop(self, active: bool, source: str):
+        frame = self._estop_mirror.update(active)
+        if frame is None:
+            return
+        if not active and self._software_estop_active:
+            self.get_logger().info('Chassis e-stop clear seen; arm remains e-stopped by software')
+            return
+        self._send_to_role(ROLE_ARM, frame, f'chassis {source} e-stop mirror')
+        if active:
+            self.get_logger().warn('Mirrored chassis e-stop to arm ESP')
+        else:
+            self.get_logger().info('Mirrored chassis e-stop clear to arm ESP')
+
+    # ESP32 -> PC handlers.
     def _handle_telemetry(self, payload: bytes):
         fmt = '<BB' + 'H' * PPM_CHANNELS + 'hhhI'
         if len(payload) < struct.calcsize(fmt):
@@ -349,20 +507,27 @@ class ESP32BridgeNode(Node):
         ppm = list(fields[2:2 + PPM_CHANNELS])
         spd_l_x10, spd_r_x10, flip_x10, uptime_ms = fields[2 + PPM_CHANNELS:]
 
-        m = String(); m.data = MODE_NAMES.get(mode_val, f'UNKNOWN_{mode_val}')
+        self._mirror_chassis_estop(bool(flags & 0x08), 'telemetry')
+
+        m = String()
+        m.data = MODE_NAMES.get(mode_val, f'UNKNOWN_{mode_val}')
         self._pub_mode.publish(m)
 
-        f = UInt8(); f.data = flags
+        f = UInt8()
+        f.data = flags
         self._pub_flags.publish(f)
 
-        p = Int16MultiArray(); p.data = [int(v) for v in ppm]
+        p = Int16MultiArray()
+        p.data = [int(v) for v in ppm]
         self._pub_ppm.publish(p)
 
         t = Float32MultiArray()
         t.data = [spd_l_x10 / 10.0, spd_r_x10 / 10.0, flip_x10 / 10.0, uptime_ms / 1000.0]
         self._pub_telemetry.publish(t)
 
-        v = Vector3(); v.x = spd_l_x10 / 10.0; v.y = spd_r_x10 / 10.0
+        v = Vector3()
+        v.x = spd_l_x10 / 10.0
+        v.y = spd_r_x10 / 10.0
         self._pub_tracks.publish(v)
 
     def _handle_encoder_ext(self, payload: bytes):
@@ -397,15 +562,13 @@ class ESP32BridgeNode(Node):
                     tfet10 / 10.0, tmot10 / 10.0, vin10 / 10.0, float(tacho)]
         self._pub_vesc.publish(msg)
 
-        # Feed the wheel-odometry integrator from the two traction VESCs.
         if vid == self._trac_id_l:
             self._update_track_distance('L', tacho, self._trac_dir_l)
         elif vid == self._trac_id_r:
             self._update_track_distance('R', tacho, self._trac_dir_r)
 
-    # ── Wheel odometry ────────────────────────────────────────────────────────
+    # Wheel odometry.
     def _tacho_to_metres(self, tacho_counts: int, direction: float) -> float:
-        """VESC tachometer (commutation steps) → output-shaft distance in metres."""
         erevs = tacho_counts / self._tacho_steps_per_erev
         mech_revs = erevs / max(self._pole_pairs, 1)
         output_revs = mech_revs / (self._gear_ratio if self._gear_ratio else 1.0)
@@ -414,13 +577,13 @@ class ESP32BridgeNode(Node):
     def _update_track_distance(self, side: str, tacho_counts: int, direction: float):
         dist = self._tacho_to_metres(tacho_counts, direction)
         if self._track_zero[side] is None:
-            self._track_zero[side] = dist        # zero the cumulative count at first reading
+            self._track_zero[side] = dist
         self._track_dist[side] = dist - self._track_zero[side]
 
     def _integrate_wheel_odom(self):
         dl_total, dr_total = self._track_dist['L'], self._track_dist['R']
         if dl_total is None or dr_total is None:
-            return  # need both tracks before integrating
+            return
 
         now = self.get_clock().now()
         if self._odom_last_t is None:
@@ -439,8 +602,8 @@ class ESP32BridgeNode(Node):
         self._odom_last['R'] = dr_total
         self._odom_last_t = now
 
-        ds = 0.5 * (dl + dr)                                  # forward increment (reliable)
-        dyaw = (dr - dl) / self._track_width_m if self._track_width_m else 0.0  # skid-steer (unreliable)
+        ds = 0.5 * (dl + dr)
+        dyaw = (dr - dl) / self._track_width_m if self._track_width_m else 0.0
         yaw_mid = self._odom_yaw + 0.5 * dyaw
         self._odom_x += ds * math.cos(yaw_mid)
         self._odom_y += ds * math.sin(yaw_mid)
@@ -458,22 +621,19 @@ class ESP32BridgeNode(Node):
         odom.twist.twist.linear.x = ds / dt
         odom.twist.twist.angular.z = dyaw / dt
 
-        # Skid-steer covariances: forward (x / vx) is trustworthy, yaw is NOT — let
-        # the EKF take heading from the ZED2 instead. Unused 2D axes get large values.
-        # [x, y, z, roll, pitch, yaw] diagonal, row-major 6×6. Tune on hardware.
         big = 1e6
-        odom.pose.covariance[0] = 0.05      # x
-        odom.pose.covariance[7] = 0.05      # y
-        odom.pose.covariance[14] = big      # z
-        odom.pose.covariance[21] = big      # roll
-        odom.pose.covariance[28] = big      # pitch
-        odom.pose.covariance[35] = 0.5      # yaw (high → distrust)
-        odom.twist.covariance[0] = 0.02     # vx
-        odom.twist.covariance[7] = big      # vy
-        odom.twist.covariance[14] = big     # vz
-        odom.twist.covariance[21] = big     # vroll
-        odom.twist.covariance[28] = big     # vpitch
-        odom.twist.covariance[35] = 0.5     # vyaw (high → distrust)
+        odom.pose.covariance[0] = 0.05
+        odom.pose.covariance[7] = 0.05
+        odom.pose.covariance[14] = big
+        odom.pose.covariance[21] = big
+        odom.pose.covariance[28] = big
+        odom.pose.covariance[35] = 0.5
+        odom.twist.covariance[0] = 0.02
+        odom.twist.covariance[7] = big
+        odom.twist.covariance[14] = big
+        odom.twist.covariance[21] = big
+        odom.twist.covariance[28] = big
+        odom.twist.covariance[35] = 0.5
         self._pub_wheel_odom.publish(odom)
 
     def _handle_odrive_status(self, payload: bytes):
@@ -521,25 +681,28 @@ class ESP32BridgeNode(Node):
         if len(payload) < 2:
             return
         val1000, = struct.unpack_from('<h', payload)
-        m = Float32(); m.data = val1000 / 1000.0
+        m = Float32()
+        m.data = val1000 / 1000.0
         self._pub_gripper.publish(m)
 
     def _handle_status(self, payload: bytes):
         if len(payload) < 4:
             return
         mode_val, flags, sensor_mask, _ = struct.unpack_from('<BBBB', payload)
+        self._mirror_chassis_estop(bool(flags & 0x08), 'status')
+
         diag = DiagnosticArray()
         diag.header.stamp = self.get_clock().now().to_msg()
         st = DiagnosticStatus()
-        st.name = 'RoboCorea ESP32'
+        st.name = 'RoboCorea chassis ESP32'
         st.level = DiagnosticStatus.OK
         st.message = MODE_NAMES.get(mode_val, f'UNKNOWN_{mode_val}')
         st.values = [
-            KeyValue(key='mode',        value=str(mode_val)),
-            KeyValue(key='ppm_ok',      value=str(bool(flags & 0x01))),
-            KeyValue(key='sensors_on',  value=str(bool(flags & 0x02))),
-            KeyValue(key='can_ok',      value=str(bool(flags & 0x04))),
-            KeyValue(key='estop',       value=str(bool(flags & 0x08))),
+            KeyValue(key='mode', value=str(mode_val)),
+            KeyValue(key='ppm_ok', value=str(bool(flags & 0x01))),
+            KeyValue(key='minipc_connected', value=str(bool(flags & 0x02))),
+            KeyValue(key='can_ok', value=str(bool(flags & 0x04))),
+            KeyValue(key='estop', value=str(bool(flags & 0x08))),
             KeyValue(key='sensor_mask', value=hex(sensor_mask)),
         ]
         if flags & 0x08:
@@ -548,33 +711,7 @@ class ESP32BridgeNode(Node):
         diag.status = [st]
         self._pub_status.publish(diag)
 
-    # ── PC → ESP32 ───────────────────────────────────────────────────────────
-    def _send(self, frame: bytes):
-        if self._ser is None:
-            return
-        try:
-            self._ser.write(frame)
-        except (serial.SerialException, OSError) as e:
-            self.get_logger().error(f'Serial write error: {e}; reconnecting')
-            self._close_serial()
-
-    def _close_serial(self):
-        try:
-            if self._ser:
-                self._ser.close()
-        except Exception:
-            pass
-        self._ser = None
-
-    def _on_estop(self, msg: Bool):
-        if msg.data:
-            self._send(_build_frame(MSG_ESTOP, b''))
-            self.get_logger().warn('Sent ESTOP')
-        else:
-            self._send(_build_frame(MSG_ESTOP_CLEAR, b''))
-
-    # ── Arm safety lifecycle ─────────────────────────────────────────────────
-    def _handle_arm_lifecycle(self, payload):
+    def _handle_arm_lifecycle(self, payload: bytes):
         if len(payload) < 7:
             return
         state, fault_code, can_fail, motor_fail, eflg = struct.unpack('<BBHHB', payload[:7])
@@ -592,31 +729,77 @@ class ESP32BridgeNode(Node):
                 f'arm lifecycle: {name} mode={mode_name} active=0x{active_mask:02X} fault={fault_code} '
                 f'can_fail={can_fail} motor_fail={motor_fail} eflg=0x{eflg:02X} '
                 f'presence=0x{presence:04X}')
-        sm = String(); sm.data = name; self._pub_arm_state.publish(sm)
-        fb = Bool(); fb.data = (state == 3); self._pub_arm_fault.publish(fb)
-        pm = UInt16(); pm.data = presence; self._pub_arm_presence.publish(pm)
-        mm = String(); mm.data = mode_name; self._pub_arm_mode.publish(mm)
-        am = UInt8(); am.data = active_mask; self._pub_arm_active.publish(am)
+        sm = String()
+        sm.data = name
+        self._pub_arm_state.publish(sm)
+        fb = Bool()
+        fb.data = (state == 3)
+        self._pub_arm_fault.publish(fb)
+        pm = UInt16()
+        pm.data = presence
+        self._pub_arm_presence.publish(pm)
+        mm = String()
+        mm.data = mode_name
+        self._pub_arm_mode.publish(mm)
+        am = UInt8()
+        am.data = active_mask
+        self._pub_arm_active.publish(am)
+
+    # PC -> ESP32.
+    def _on_estop(self, msg: Bool):
+        active = bool(msg.data)
+        if self._software_estop_active is not None and active == self._software_estop_active:
+            return
+        self._software_estop_active = active
+
+        frame = build_frame(MSG_ESTOP if active else MSG_ESTOP_CLEAR, b'')
+        if active:
+            sent = self._broadcast_frame(frame, 'software e-stop')
+            message = (
+                'Sent software ESTOP to all discovered ESP links'
+                if sent else 'Software ESTOP queued, no ESP links')
+            self.get_logger().warn(message)
+        else:
+            chassis_sent = self._send_to_role(ROLE_CHASSIS, frame, 'software e-stop clear', log_missing=False)
+            arm_sent = False
+            if not self._estop_mirror.active:
+                arm_sent = self._send_to_role(ROLE_ARM, frame, 'software e-stop clear', log_missing=False)
+            sent = chassis_sent or arm_sent
+            if self._estop_mirror.active:
+                message = (
+                    'Sent software ESTOP clear to chassis; arm remains e-stopped by chassis mirror'
+                    if sent else 'Software ESTOP clear queued; arm remains e-stopped by chassis mirror')
+            else:
+                message = (
+                    'Sent software ESTOP clear to discovered ESP links'
+                    if sent else 'Software ESTOP clear queued, no ESP links')
+            self.get_logger().info(message)
 
     def _srv_arm(self, request, response):
-        self._send(_build_frame(MSG_ARM_INIT, b''))
-        response.success = True
-        response.message = 'arm init/arm requested'
-        self.get_logger().info('Arm: init/arm requested')
+        sent = self._send_to_role(ROLE_ARM, build_frame(MSG_ARM_INIT, b''), 'arm init service')
+        response.success = sent
+        response.message = 'arm init/arm requested' if sent else 'arm ESP link unavailable'
+        if sent:
+            self.get_logger().info('Arm: init/arm requested')
         return response
 
     def _srv_disarm(self, request, response):
-        self._send(_build_frame(MSG_ARM_DISARM, b''))
-        response.success = True
-        response.message = 'arm disarm requested'
-        self.get_logger().warn('Arm: disarm requested')
+        sent = self._send_to_role(ROLE_ARM, build_frame(MSG_ARM_DISARM, b''), 'arm disarm service')
+        response.success = sent
+        response.message = 'arm disarm requested' if sent else 'arm ESP link unavailable'
+        if sent:
+            self.get_logger().warn('Arm: disarm requested')
         return response
 
-    def _request_arm_mode(self, mode, name, response):
-        self._send(_build_frame(MSG_ARM_MODE, bytes([mode])))
-        response.success = True
-        response.message = f'{name.lower()} mode requested'
-        self.get_logger().info(f'Arm mode: {name} requested')
+    def _request_arm_mode(self, mode: int, name: str, response):
+        sent = self._send_to_role(
+            ROLE_ARM,
+            build_frame(MSG_ARM_MODE, bytes([mode])),
+            f'arm {name.lower()} mode service')
+        response.success = sent
+        response.message = f'{name.lower()} mode requested' if sent else 'arm ESP link unavailable'
+        if sent:
+            self.get_logger().info(f'Arm mode: {name} requested')
         return response
 
     def _srv_dexterity_mode(self, request, response):
@@ -634,28 +817,39 @@ class ESP32BridgeNode(Node):
             for i, n in enumerate(self._joint_names)
         ]
         payload = struct.pack('<' + 'h' * 6, *[int(d * 100.0) for d in degs])
-        self._send(_build_frame(MSG_ARM_JOINTS, payload))
+        self._send_to_role(ROLE_ARM, build_frame(MSG_ARM_JOINTS, payload), 'joint state forwarding')
 
     def _on_sensor_enable(self, msg: UInt8):
-        self._send(_build_frame(MSG_SENSOR_ENABLE, bytes([msg.data])))
-        self.get_logger().info(f'Sensor enable mask: 0x{msg.data:02X}')
-
-    def _on_keybind(self, msg: UInt8MultiArray):
-        if len(msg.data) < 15:
-            self.get_logger().warn('keybind needs 15 bytes (3 modes × 5 channels)')
-            return
-        self._send(_build_frame(MSG_KEYBIND, bytes(msg.data[:15])))
-        self.get_logger().info('Keybind table sent to ESP32')
+        self._last_sensor_mask = int(msg.data) & 0xFF
+        self._send_to_role(
+            ROLE_CHASSIS,
+            build_frame(MSG_SENSOR_ENABLE, bytes([self._last_sensor_mask])),
+            'sensor enable',
+        )
+        self.get_logger().info(f'Sensor enable mask: 0x{self._last_sensor_mask:02X}')
 
     def _on_ppm_calib(self, msg: UInt16MultiArray):
         if len(msg.data) < 19:
             self.get_logger().warn(f'ppm_calib needs 19 values, got {len(msg.data)}')
             return
         payload = struct.pack('<' + 'HHH' * 6 + 'H', *[int(v) for v in msg.data[:19]])
-        self._send(_build_frame(MSG_PPM_CALIB, payload))
-        db = Float32(); db.data = msg.data[18] / 1000.0
+        self._send_to_role(ROLE_CHASSIS, build_frame(MSG_PPM_CALIB, payload), 'PPM calibration')
+        db = Float32()
+        db.data = msg.data[18] / 1000.0
         self._pub_deadband.publish(db)
         self.get_logger().info(f'PPM calibration sent (deadband={db.data:.3f})')
+
+    def destroy_node(self):
+        self._discovery_stop.set()
+        if hasattr(self, '_discovery_thread'):
+            self._discovery_thread.join(timeout=1.0)
+        with self._links_lock:
+            links = list(self._links_by_realpath.values())
+        for link in links:
+            link.stop()
+        for link in links:
+            link.join(timeout=1.0)
+        return super().destroy_node()
 
 
 def main(args=None):

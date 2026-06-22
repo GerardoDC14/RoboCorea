@@ -1,0 +1,11 @@
+# Plan a collision-free joint path to a target end-effector pose and execute it.
+# Target is either a saved pose (by name) or an inline pose (use_pose=true).
+# The response returns once PLANNING completes; motion then runs asynchronously
+# (watch /servo_node/status and /servo_node/plan_state). Nudging the sticks or
+# pausing the servo aborts an in-progress motion.
+string name                  # saved-pose name (ignored when use_pose is true)
+bool use_pose                # true => target the inline `pose` instead of `name`
+geometry_msgs/Pose pose      # target EE pose (base_frame) when use_pose is true
+---
+bool success                 # true => a path was planned and motion started
+string message

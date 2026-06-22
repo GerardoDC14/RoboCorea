@@ -1,15 +1,15 @@
 # esp32_bridge
 
-RoboCorea Jetson-side ROS 2 (Humble) node that bridges the ESP32 binary UART
-protocol to ROS 2 topics. This is the "relay" core described in
+RoboCorea Jetson-side ROS 2 (Humble) node that bridges two ESP32 binary UART
+links to ROS 2 topics. This is the "relay" core described in
 [`../../../../reference/architecture.md`](../../../../reference/architecture.md):
-it runs on the Jetson Orin Nano, publishes telemetry/sensor/motor status, and
-forwards commands (arm joints, e-stop, keybinds, PPM calibration, sensor enable)
-back down to the ESP32.
+it runs on the Jetson Orin Nano, auto-identifies the chassis and arm PCBs from
+their firmware identity frames, publishes telemetry/sensor/motor status, and
+forwards commands to the owning board.
 
 The wire format is the packed binary protocol in the firmware's
-`include/robot_types.h`; the `struct` formats in `main_bridge.py` must stay
-byte-identical to it.
+`include/robot_types.h`; the `struct` formats in `main_bridge.py` and constants
+in `protocol.py` must stay byte-identical to it.
 
 ## Build
 
@@ -54,14 +54,35 @@ mode. It is zero while the arm lifecycle is not `READY`.
 ## Run
 
 ```bash
-ros2 launch esp32_bridge esp32_bridge.launch.py serial_port:=/dev/ttyUSB0 baud_rate:=921600
+ros2 launch esp32_bridge esp32_bridge.launch.py
+
+# Optional explicit bench override:
+ros2 launch esp32_bridge esp32_bridge.launch.py serial_port:=/dev/serial/by-id/usb-...
 ```
 
-The node opens the serial port asynchronously and reconnects on unplug. It
-starts with all ESP32 sensors disabled; enable them by publishing a bitmask on
-`/sensors/enable_mask` (bit0 = magnetometer; the ESP32 has no IMU — orientation
-comes from the ZED2 camera). It also integrates the two traction VESCs'
-tachometers into track odometry on `/odom/wheel` (`nav_msgs/Odometry`).
+By default the node scans only the allowlisted globs in `serial_candidates`
+(`/dev/serial/by-id/*,/dev/serial/by-path/*`). Raw `/dev/ttyUSB*` probing is
+opt-in by changing that parameter. Each candidate is opened asynchronously and
+bound only after firmware sends `MSG_BOARD_IDENTITY`.
+
+Discovery re-runs every `discovery_period` seconds (default 2 s) and is keyed by
+resolved device (`realpath`), so a board matched by both the by-id and by-path
+globs yields a single link. A link whose device has disappeared (unplugged, or a
+USB re-enumeration that moved it to a new `/dev/ttyUSB*`) is **reaped** — its
+thread is stopped and its role binding cleared — before a fresh link is started,
+so the map cannot leak links or open a re-enumerated board twice. Ports are also
+opened `exclusive` (POSIX flock) as a second guard against a double-open race.
+
+The chassis role publishes `/robot/*`, `/encoders/*`, `/odom/wheel`,
+`/sensors/mag`, and `/motors/vesc_status`. The arm role publishes `/arm/*` plus
+ODrive/LKTech/ZE300 telemetry. Software `/robot/estop` is broadcast to all
+discovered ESP links; chassis RC e-stop transitions are mirrored to the arm ESP
+over the Jetson bridge.
+
+Sensors start disabled; enable them by publishing `/sensors/enable_mask`
+(bit0 = magnetometer; the ESP32 has no IMU — orientation comes from the ZED2).
+The bridge integrates the two traction VESC tachometers into track odometry on
+`/odom/wheel` (`nav_msgs/Odometry`).
 
 ## Topics
 

@@ -3,6 +3,7 @@
 #include <QMainWindow>
 
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/u_int16_multi_array.hpp>
 
 #include <atomic>
 #include <memory>
@@ -16,6 +17,7 @@ class DashboardPanel;
 class OdometryPanel;
 class DigitalTwinPanel;
 class GstAvStream;
+class SettingsDialog;
 class QWidget;
 
 class MainWindow : public QMainWindow {
@@ -26,9 +28,12 @@ public:
 
 private slots:
     void onSourcesUpdated();
+    void onSettingsRequested();   // open the SettingsDialog (lazy)
+    void onSettingsApplied();     // republish ppm_calib + push grammar/audio
 
 private:
     void startRosSpinThread();
+    void publishPpmCalib();       // AppSettings.ppm_calib → /robot/ppm_calib (18 u16)
     QWidget* buildRightColumn();      // digital twin (top) + dashboard (bottom)
     QWidget* wrapScroll(QWidget* w);  // scrollable container for a tall panel
 #ifdef HAVE_GSTREAMER
@@ -42,7 +47,10 @@ private:
     DashboardPanel* dashboard_panel_;
     OdometryPanel* odometry_panel_;
     DigitalTwinPanel* digital_twin_panel_;
+    SettingsDialog* settings_dialog_{nullptr};
     std::shared_ptr<CameraHub> camera_hub_;
+
+    rclcpp::Publisher<std_msgs::msg::UInt16MultiArray>::SharedPtr ppm_calib_pub_;
 #ifdef HAVE_GSTREAMER
     std::vector<std::shared_ptr<GstAvStream>> av_streams_;
 #endif

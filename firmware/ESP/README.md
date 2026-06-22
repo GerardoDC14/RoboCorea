@@ -1,8 +1,9 @@
 # RoboCorea ESP32 firmware
 
-PlatformIO project (DOIT ESP32 DevKit V1, custom PCB) that runs the robot's
-real-time I/O: it decodes the RC receiver, drives every motor over a single CAN
-bus, reads the magnetometer, and talks to the Jetson over USB serial.
+PlatformIO project (DOIT ESP32 DevKit V1, custom PCB) for the robot's real-time
+I/O. Two identical PCBs run this same firmware: one built as **chassis** and one
+built as **arm**. The only intended per-board difference is
+`ROBOCOREA_BOARD_ROLE` in `include/config.h`.
 
 For the whole-system picture see [`../../reference/architecture.md`](../../reference/architecture.md).
 
@@ -13,13 +14,15 @@ For the whole-system picture see [`../../reference/architecture.md`](../../refer
 | Subsystem | Description |
 |-----------|-------------|
 | **RC input** | Decodes a 6-channel PPM stream from the FlySky FS-iA6B on `GPIO4` (ISR). |
-| **Keybind / modes** | Ch5 (3-position lever) selects one of three keybind rows. Each row maps Ch1–Ch4 + Ch6 to a function (traction, flippers, arm axes, e-stop). The GUI can replace the table at runtime. |
+| **Board role** | `ROBOCOREA_BOARD_ROLE_CHASSIS` owns RC, traction, flippers, wheel-odom VESC telemetry, and magnetometer. `ROBOCOREA_BOARD_ROLE_ARM` owns ODrive/ZE300/LKTech arm CAN. |
+| **Control scheme (fixed)** | No keybind table. Ch3=traction fwd, Ch4=turn, Ch2=flipper rate, Ch1=flipper L/R selector (min/center/max = left/both/right), Ch5=2-state pair select (min=front FL·FR, max=rear RL·RR), Ch6=3-position lever (down=E-STOP, center=normal, up=virtual-flip). Drive + flippers are always active together. See `config.h` "Channel roles". |
+| **Virtual flip (Ch6 up)** | "Drive from the other end" — a 180° remap of the control frame (negate forward, swap front/rear pair, mirror flipper L/R; turn is left as-is) so the symmetric robot can back out of a dead end without turning around. Signs are `VFLIP_*` macros in `config.h`. |
 | **Traction** | 2 VESCs, differential drive, `SET_RPM` velocity commands. |
-| **Flippers** | 4 VESCs. The **position loop runs on the VESC** (LispBM — see [`../VESC/flipper_position.lisp`](../VESC/flipper_position.lisp)). The ESP integrates the stick into a target angle and sends it over a custom CAN frame; the VESC closes the loop and reports its angle back. Center stick = hold; no separate encoders. |
-| **Arm relay** | In ARM mode the tracks stop and the latest joint command from the PC is sent to the arm motors over CAN: ODrive J1–J3, ZE300 J4, LKTech J5–J6. |
+| **Flippers** | 4 VESCs. The **position loop runs on the VESC** (LispBM — see [`../VESC/flipper_position.lisp`](../VESC/flipper_position.lisp)). The ESP integrates the stick into a target angle, sends it through the fake-RPM carrier, and reports measured `[FL, FR, RL, RR]` angles from STATUS_5 tachometer feedback. Center stick = hold; no separate encoders. |
+| **Arm relay** | Arm-role firmware relays workstation joint commands (gamepad → IK) to CAN whenever armed & not e-stopped: ODrive J1–J3, ZE300 J4, LKTech J5–J6. |
 | **Arm operating mode** | Dexterity controls J1–J6. Chassis/transport keeps J1–J4 controlled and sends LKTech J5/J6 to motor-stop (torque-off). |
 | **Sensors** | LIS3MDL magnetometer over I2C. (No IMU on the ESP32 — orientation comes from the ZED2 camera on the Jetson; the thermal camera is on the Jetson; there is no gas sensor.) |
-| **Protocol** | Binary UART at 921600 baud to the Jetson. Telemetry at 50 Hz; the PC sends arm joints, keybinds, PPM calibration, sensor-enable, and e-stop. |
+| **Protocol** | Binary UART at 921600 baud to the Jetson. Each board periodically sends `MSG_BOARD_IDENTITY`, then only publishes the telemetry owned by its role. |
 
 ---
 
@@ -27,10 +30,10 @@ For the whole-system picture see [`../../reference/architecture.md`](../../refer
 
 | Core | Task | Rate | Prio | Purpose |
 |------|------|------|------|---------|
-| 1 | `controlTask` | 50 Hz | 5 | State machine, keybinds, flipper setpoint integration, motor output |
-| 1 | `sensorTask`  | ~50 Hz | 2 | LIS3MDL magnetometer sampling |
-| 0 | `commsTask`   | 50 Hz | 4 | UART RX parse + telemetry/sensor/motor-status TX |
-| 0 | `canTask`     | 200 Hz | 4 | CAN drain + ODrive telemetry RTRs + bus-health recovery |
+| 1 | `controlTask` | 50 Hz | 5 | Chassis: RC/base FSM. Arm: relay latest joint command while armed. |
+| 1 | `sensorTask`  | ~50 Hz | 2 | Chassis role only: LIS3MDL magnetometer sampling |
+| 0 | `commsTask`   | 50 Hz | 4 | UART RX parse + identity + role-owned telemetry TX |
+| 0 | `canTask`     | 200 Hz | 4 | Chassis: VESC CAN. Arm: ODrive/ZE300/LKTech CAN. |
 
 All UART transmission is funnelled through a mutex in `Comms` so frames from
 `commsTask` and the occasional gripper frame from `controlTask` never interleave.
@@ -39,9 +42,10 @@ All UART transmission is funnelled through a mutex in `Comms` so frames from
 
 ## CAN bus
 
-One **500 kbps** bus (`config.h: CAN_BITRATE_BPS`) shared by all actuators —
-matches the working board / VESC config. (To move to 1 Mbps, change that constant
-**and** set every controller's CAN baud in its tool.)
+Each PCB has one **500 kbps** bus (`config.h: CAN_BITRATE_BPS`). The chassis bus
+has the 6 VESCs only; the arm bus has the 3 ODrives, ZE300, and 2 LKTech motors.
+(To move to 1 Mbps, change that constant **and** set every controller's CAN baud
+in its tool.)
 
 **Transceiver backend** is a compile-time switch in `config.h` — the rest of the
 CAN code goes through a small HAL and doesn't care which is used:
@@ -58,13 +62,15 @@ recovery** and a cross-core SPI mutex for the MCP2515 path.
 
 - **VESC traction (L/R)** — extended frames, ID = `(cmd<<8)|id`, `SET_RPM`
   (cmd 3). Status frames 1/4/5 give speed/temp/voltage telemetry.
-- **VESC flippers (×4)** — position loop runs **on the VESC** (LispBM). The ESP
-  sends a target angle and receives the measured angle via **custom CAN frames**
-  (`VESC_CMD_FLIPPER_TARGET 0x7E` / `VESC_CMD_FLIPPER_REPORT 0x7F`, see
-  [`../VESC/`](../VESC/)). No tachometer parsing on the ESP for flippers.
-- **ODrive** (J1–J3) — CANSimple, `SET_INPUT_POS`; encoder zero captured at boot.
-- **ZE300** (J4) — output-degree position; boot pose captured as zero.
-- **LKTech** (J5–J6) — multi-loop angle control; boot pose captured as zero.
+- **VESC flippers (×4)** — position loop runs **on the VESC** (LispBM). The
+  reliable command path is the legacy fake-RPM carrier:
+  `SET_RPM = target_degrees * 1000`, read by the Lisp with `get-rpm-set`.
+  Measured flipper angle comes from each VESC's STATUS_5 tachometer when
+  `FLIPPER_USE_TACH_FEEDBACK=1`, so manual movement can show up in
+  `/encoders/flipper` while the VESC is powered and broadcasting STATUS_5.
+- **ODrive** (J1–J3) — arm role only; CANSimple, `SET_INPUT_POS`; encoder zero captured at boot.
+- **ZE300** (J4) — arm role only; output-degree position; boot pose captured as zero.
+- **LKTech** (J5–J6) — arm role only; multi-loop angle control; boot pose captured as zero.
 
 VESC IDs (`60/50` traction, `20/10/40/30` flippers) and all gear ratios /
 direction signs live in `config.h` and **must be confirmed on the bench** (see
@@ -77,22 +83,40 @@ in VESC Tool for traction/voltage/temperature telemetry.
 
 The flipper position loop runs **on each flipper VESC** in LispBM
 ([`../VESC/flipper_position.lisp`](../VESC/flipper_position.lisp)) — PD + stiction
-feedforward with shortest-path error on a wrapped `[0,360)` angle, so a flipper
-can spin continuously past 360°. The ESP32's only jobs are:
+feedforward with shortest-path error on a wrapped `[0,360)` angle, so crossing
+0/360 is smooth. The ESP32's jobs are:
 
 1. **Integrate the stick into a target angle** (`controlTask`, 50 Hz): stick
    deflection = rate (`FLIPPER_RATE_DPS`), so the target moves while deflected and
    **holds** where released. Direction sign is applied here (`FLIPPER_DIR_*`).
-2. **Send the target** as an absolute wrapped angle (`SET_RPM` is *not* used —
-   that would fight the lisp's `set-current`). On (re)entering flipper control the
-   ESP seeds the target from the VESC-reported angle for a **bumpless** start.
-3. **Receive the measured angle** the VESC reports back, for GUI telemetry.
+2. **Send the target** through fake RPM (`SET_RPM = degrees * 1000`). The Lisp
+   treats it as a position setpoint, not a speed command. On (re)entering flipper
+   control the ESP seeds the target from measured angle for a **bumpless** start.
+3. **Derive measured angle** from the VESC STATUS_5 tachometer for telemetry.
+   Enable STATUS_5 broadcasts on all four flipper VESCs.
 
 Failsafe: on RC-loss the ESP keeps re-sending the frozen target (**hold**, never
-"go home"); on hard e-stop it sends `enable=0` to coast (or hold, per
-`FLIPPER_ESTOP_HOLD`). The angle scale (`deg-per-dist`) and the PD gains live in
-the **lisp**, not `config.h` — **verify the reported angle tracks physical
-rotation 1:1 on the bench**.
+"go home"). In fake-RPM mode, hard e-stop target behavior follows
+`FLIPPER_ESTOP_HOLD`, but there is no separate Lisp enable/coast bit. The Lisp's
+internal angle scale (`deg-per-dist`) and the ESP tachometer scale
+(`FLIPPER_TACH_DEG_PER_COUNT_*`) both need bench calibration.
+
+### Fake-RPM + Tach Hybrid
+
+Default bring-up mode:
+
+```c
+#define FLIPPER_USE_LEGACY_RPM_LISP  1
+#define FLIPPER_USE_TACH_FEEDBACK    1
+```
+
+This avoids the custom `0x7E/0x7F` Lisp CAN path. The VESC still closes position
+locally, while the ESP uses tachometer feedback for `/encoders/flipper` and
+bumpless target seeding. The tachometer angle is relative to the first
+STATUS_5 frame after ESP boot plus
+`FLIPPER_TACH_ZERO_DEG_*`, then folded into `[0,360)` so full turns are dropped.
+With the current sign calibration, a 90 degree downward move reports as `270`.
+Power up in a known flipper pose or set offsets.
 
 ---
 
@@ -111,11 +135,12 @@ and must stay in sync with the Jetson bridge `struct` formats.
 | → PC | 0x07 | Flipper angles (FL,FR,RL,RR) |
 | → PC | 0x08 | VESC status (incl. tachometer → track odometry) |
 | → PC | 0x0A / 0x0B / 0x0C / 0x0D | ODrive / LKTech / ZE300 status, ODrive error |
+| → PC | 0x0E / 0x0F | Arm lifecycle / board identity |
 | ← PC | 0x10 | Arm joints (6 × int16 deg×100) |
 | ← PC | 0x11 | Sensor enable mask |
 | ← PC | 0x12 / 0x13 | E-stop / clear |
 | ← PC | 0x19 | Arm operating mode: `0` dexterity, `1` chassis |
-| ← PC | 0x14 | Keybind table (15 bytes) |
+| ← PC | 0x14 | *(reserved — was the keybind table; RC scheme is fixed now)* |
 | ← PC | 0x15 | PPM calibration |
 | ← PC | 0x16 | Gripper (→ PC originates; reserved) |
 
@@ -123,17 +148,20 @@ and must stay in sync with the Jetson bridge `struct` formats.
 but the numbering is kept stable for GUI compatibility. Orientation now comes from
 the ZED2 camera on the Jetson, not the ESP32.)
 
+The Jetson bridge routes outbound frames by role. Chassis ignores arm-only frames;
+arm ignores chassis-only frames; both accept software e-stop frames.
+
 ---
 
 ## Modes & arm relay
 
-`INIT → STANDBY → NORMAL / FLIPPER / ARM`, plus `ESTOP`. The high-level mode is
-derived from what the active Ch5 keybind row binds. The arm is relayed to CAN
-**only in ARM mode** (tracks stopped). Joint commands received over UART while
-**not** in ARM mode are **dropped**; on entering ARM mode the buffered target is
-invalidated, so the arm only follows `/joint_states` received from that point on
-(no jump to a stale pose). Ch6 HIGH (or an MSG_ESTOP frame) forces ESTOP, which
-neutralises the drivetrain and stops the arm.
+Chassis role: `INIT → STANDBY → NORMAL`, plus `ESTOP` (the legacy
+`FLIPPER`/`ARM` enum values are reserved-unused). Once the RC link is up, it
+drives the tracks **and** flippers from the fixed scheme every loop.
+
+Arm role: starts without PPM, accepts arm lifecycle commands, and relays the
+latest workstation arm-joint stream whenever not e-stopped and the arm lifecycle
+is `READY`. Chassis RC e-stop is mirrored to the arm by the Jetson bridge.
 
 The arm operating mode is independent of the robot's high-level `ARM` mode.
 `DEXTERITY` is the boot default. `CHASSIS` gates all J5/J6 position frames before
@@ -145,10 +173,10 @@ J5/J6 are enabled again only by an explicit switch back to `DEXTERITY`.
 ## Project layout
 
 ```
-include/  config.h        pins, CAN/VESC IDs, gear ratios, flipper params, protocol IDs
+include/  config.h        board role, pins, CAN/VESC IDs, gear ratios, flipper params, protocol IDs
           robot_types.h   enums, structs, packed payloads (+ static_asserts)
 lib/      RC/             PPM decode (ISR) + calibration
-          Control/        state machine, keybinds, flipper setpoint integration
+          Control/        state machine, fixed RC control mapping, flipper setpoint integration
           Locomotion/     drivetrain output (track mix + flipper angle/hold)
           CANInterface/   CAN HAL (MCP2515/TWAI) + VESC/ODrive/ZE300/LKTech
           Comms/          binary UART protocol
@@ -169,6 +197,8 @@ pio run -t upload  # flash
 pio device monitor # only shows text if ENABLE_COMMS is disabled in config.h
 ```
 
-Confirm `config.h` (pins, VESC IDs, gear ratios, directions, PID gains) against
-the real PCB before commanding motors. Bring up motors one at a time with small
-commands.
+Leave `ROBOCOREA_BOARD_ROLE` as `ROBOCOREA_BOARD_ROLE_CHASSIS` for the chassis
+PCB. Change only that macro to `ROBOCOREA_BOARD_ROLE_ARM` before building and
+flashing the arm PCB. Confirm pins, CAN IDs, gear ratios, directions, and PID
+gains against the real hardware before commanding motors. Bring up motors one at
+a time with small commands.

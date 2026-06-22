@@ -49,6 +49,19 @@ void AppSettings::load()
             vosk_grammar = o["vosk_grammar"].toString().toStdString();
     }
 
+    // PPM calibration: flat array of 18 (6 channels × {min, neutral, max}).
+    if (o.contains("ppm_calib") && o["ppm_calib"].isArray()) {
+        QJsonArray arr = o["ppm_calib"].toArray();
+        if (arr.size() == 18) {
+            std::lock_guard<std::mutex> lk(ppm_calib_mutex);
+            for (int c = 0; c < 6; ++c) {
+                ppm_calib[c].min_us     = arr[c * 3 + 0].toInt(1000);
+                ppm_calib[c].neutral_us = arr[c * 3 + 1].toInt(1500);
+                ppm_calib[c].max_us     = arr[c * 3 + 2].toInt(2000);
+            }
+        }
+    }
+
     std::lock_guard<std::mutex> lk(video_mutex);
     if (o.contains("default_robot_host"))
         default_robot_host = o["default_robot_host"].toString().toStdString();
@@ -84,6 +97,17 @@ void AppSettings::save()
     {
         std::lock_guard<std::mutex> lk(strings_mutex);
         o["vosk_grammar"] = QString::fromStdString(vosk_grammar);
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(ppm_calib_mutex);
+        QJsonArray arr;
+        for (int c = 0; c < 6; ++c) {
+            arr.append(ppm_calib[c].min_us);
+            arr.append(ppm_calib[c].neutral_us);
+            arr.append(ppm_calib[c].max_us);
+        }
+        o["ppm_calib"] = arr;
     }
 
     {

@@ -14,7 +14,6 @@
 using ArmJointsCallback    = void(*)(const ArmJointsPayload&);
 using SensorEnableCallback = void(*)(uint8_t mask);
 using EstopCallback        = void(*)(bool active);
-using KeybindCallback      = void(*)(const KeybindPayload&);
 using PpmCalibCallback     = void(*)(const PpmCalibPayload&);
 using ArmLifecycleCallback = void(*)(bool arm);   // true = arm/init, false = disarm
 using ArmModeCallback      = void(*)(uint8_t mode);
@@ -36,12 +35,12 @@ public:
     static void sendStatus(const SystemStatus& status);
     static void sendGripper(float norm);
     static void sendArmLifecycle(const ArmLifecyclePayload& p);
+    static void sendBoardIdentity();
 
     // ── Callback registration ─────────────────────────────────────────────────
     static void onArmJoints(ArmJointsCallback cb)      { s_cb_arm = cb; }
     static void onSensorEnable(SensorEnableCallback cb) { s_cb_sensor = cb; }
     static void onEstop(EstopCallback cb)               { s_cb_estop = cb; }
-    static void onKeybind(KeybindCallback cb)           { s_cb_keybind = cb; }
     static void onPpmCalib(PpmCalibCallback cb)         { s_cb_ppm_calib = cb; }
     static void onArmLifecycle(ArmLifecycleCallback cb) { s_cb_arm_life = cb; }
     static void onArmMode(ArmModeCallback cb)           { s_cb_arm_mode = cb; }
@@ -66,7 +65,6 @@ private:
     static ArmJointsCallback    s_cb_arm;
     static SensorEnableCallback s_cb_sensor;
     static EstopCallback        s_cb_estop;
-    static KeybindCallback      s_cb_keybind;
     static PpmCalibCallback     s_cb_ppm_calib;
     static ArmLifecycleCallback s_cb_arm_life;
     static ArmModeCallback      s_cb_arm_mode;
