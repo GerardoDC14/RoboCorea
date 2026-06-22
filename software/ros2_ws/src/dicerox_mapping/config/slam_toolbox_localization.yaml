@@ -1,0 +1,50 @@
+slam_toolbox:
+  ros__parameters:
+
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_footprint
+    scan_topic: /scan_flat
+    use_map_saver: false
+    mode: localization
+
+    # Path to the serialized map produced by save_map.launch.py (no extension).
+    # Example: ~/maps/dicerox_map
+    map_file_name: /home/user/maps/dicerox_map
+    map_start_pose: [0.0, 0.0, 0.0]
+
+    debug_logging: false
+    throttle_scans: 1
+    scan_queue_size: 100
+    transform_publish_period: 0.02   # seconds
+    map_update_interval: 5.0         # seconds (longer interval is fine for localization)
+    resolution: 0.05                 # meters/cell
+    min_laser_range: 0.1             # Slamtec A1 min
+    max_laser_range: 12.0            # Slamtec A1 max
+    minimum_time_interval: 0.15
+    transform_timeout: 1.0
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+
+    use_scan_matching: true
+    use_scan_barycenter: true
+    minimum_travel_distance: 0.1     # meters
+    minimum_travel_heading: 0.1      # radians
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 10.0
+    link_match_minimum_response_fine: 0.1
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true
