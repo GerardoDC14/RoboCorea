@@ -124,11 +124,12 @@ bool CameraHub::openSource(cv::VideoCapture& cap, const std::string& source_id)
         // grabbers on one shared USB 2.0 bus (a hub) cannot all reserve the
         // isochronous bandwidth uncompressed YUYV needs, so only one opens at a
         // time; MJPG shrinks the reservation ~10x so they stream in parallel.
-        // 640x480 is supported by the RF driving-cam digitizers and is plenty
-        // for a low-latency driving feed. Cameras without MJPG just ignore this.
+        // Ask for 1280x720 (16:9) so wide cameras (e.g. a C920) deliver their
+        // full field of view instead of a cropped 4:3 frame; cameras that top
+        // out lower (the SD grabbers) negotiate down to their max, still MJPG.
         cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-        cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-        cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+        cap.set(cv::CAP_PROP_FRAME_WIDTH, 1280);
+        cap.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
         return true;
     }
     if (source_id.rfind("gst:", 0) == 0) {
