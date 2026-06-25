@@ -31,11 +31,16 @@ MainWindow::MainWindow(rclcpp::Node::SharedPtr node, QWidget* parent)
     camera_hub_ = std::make_shared<CameraHub>();
     video_panel_ = new VideoPanel(node_, camera_hub_, this);
 
-    // Layout: video on the left, and a right section with the digital twin on
-    // top over the odometry + dashboard panels side by side below.
+    // Layout: the left section is a 2×2 grid of 3 video cells plus the telemetry
+    // (odometry) panel in the bottom-right cell; the right section is the digital
+    // twin on top over the dashboard (connections), which now fills the space the
+    // telemetry used to share. buildRightColumn() creates the panels.
+    auto* right_column = buildRightColumn();
+    video_panel_->setCornerWidget(wrapScroll(odometry_panel_));
+
     auto* main_splitter = new QSplitter(Qt::Horizontal, this);
     main_splitter->addWidget(video_panel_);
-    main_splitter->addWidget(buildRightColumn());
+    main_splitter->addWidget(right_column);
     main_splitter->setStretchFactor(0, 1);  // video takes the slack on resize
     main_splitter->setSizes({980, 620});
     setCentralWidget(main_splitter);
@@ -152,18 +157,15 @@ QWidget* MainWindow::buildRightColumn()
     // spanning the full width of the right section.
     digital_twin_panel_ = new DigitalTwinPanel(node_, this);
 
-    // Bottom: odometry (telemetry) and dashboard side by side, each scrollable.
+    // The odometry (telemetry) panel is created here but hosted in the video
+    // grid's bottom-right cell (see the constructor); the dashboard (connections)
+    // now occupies the whole bottom of this right section.
     odometry_panel_ = new OdometryPanel(node_, this);
     dashboard_panel_ = new DashboardPanel(node_, this);
 
-    auto* bottom_splitter = new QSplitter(Qt::Horizontal, this);
-    bottom_splitter->addWidget(wrapScroll(odometry_panel_));
-    bottom_splitter->addWidget(wrapScroll(dashboard_panel_));
-    bottom_splitter->setSizes({320, 320});
-
     auto* right_splitter = new QSplitter(Qt::Vertical, this);
     right_splitter->addWidget(digital_twin_panel_);
-    right_splitter->addWidget(bottom_splitter);
+    right_splitter->addWidget(wrapScroll(dashboard_panel_));
     right_splitter->setSizes({420, 480});
     return right_splitter;
 }
