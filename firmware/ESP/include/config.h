@@ -326,7 +326,7 @@
 // apply the whole sign here). Still re-verify on bench against the final
 // workstation joint-command sign convention.
 #define ZE300_DIR_J4          (1.0f)
-#define ZE300_MAX_SPEED_CRPM    417    // 25 output deg/s -> 4.17 RPM -> 417 centi-RPM
+#define ZE300_MAX_SPEED_CRPM    667    // 40 output deg/s -> 6.67 RPM -> 667 centi-RPM (matches ramp)
 #define ZE300_ZERO_TIMEOUT_MS   250    // blocking timeout for startup RTRs (per try)
 #define ZE300_INIT_MAX_RETRIES    5    // B2 (set-speed) only ACKs after a power-on warmup — retry
 #define ZE300_INIT_RETRY_DELAY_MS 100
@@ -345,7 +345,7 @@
 // in the reference. Re-verify both on bench against the workstation sign.
 #define LKTECH_DIR_J5         (1.0f)
 #define LKTECH_DIR_J6         (1.0f)
-#define LKTECH_DEFAULT_SPEED_DPS  250  // 25 output deg/s × 10:1 gear = 250 motor deg/s
+#define LKTECH_DEFAULT_SPEED_DPS  400  // 40 output deg/s × 10:1 gear = 400 motor deg/s (matches ramp)
 #define LKTECH_ZERO_TIMEOUT_MS    250
 #define LKTECH_INIT_MAX_RETRIES    5   // motor-on / read-angle intermittent on first txns — retry
 #define LKTECH_INIT_RETRY_DELAY_MS 100
@@ -410,8 +410,13 @@
 // reference's coordinated-motion defaults.
 #define ARM_COMMAND_PERIOD_MS    50    // match working Dicerox 6-DOF stream interval
 #define ARM_RAMP_ENABLE           1
-#define ARM_RAMP_MAX_VEL_DPS   { 12.5f, 10.0f, 10.0f, 25.0f, 25.0f, 25.0f }
-#define ARM_RAMP_MAX_ACC_DPS2  { 37.5f, 30.0f, 30.0f, 75.0f, 75.0f, 75.0f }
+// Tuned bump (2026-06): J3 (and J2) were the slowest tier at 10 deg/s and lagged
+// the wrist; raised so no joint is the dominant bottleneck. J1-J3 (ODrive) were
+// vibrating at 30/25/25 vel + 90/75/75 acc, so backed off to a gentler middle
+// ground (accel cut harder than vel, ~2.2:1 ratio) — still well above the old
+// 12.5/10/10. ODrive trap_traj headroom is ~150 deg/s output (20 turns/s / 48:1).
+#define ARM_RAMP_MAX_VEL_DPS   { 20.0f, 18.0f, 18.0f, 40.0f, 40.0f, 40.0f }
+#define ARM_RAMP_MAX_ACC_DPS2  { 45.0f, 40.0f, 40.0f, 120.0f, 120.0f, 120.0f }
 
 // ─── Sensors ─────────────────────────────────────────────────────────────────
 // Passive victim-detection sensors are Jetson-hosted now: LIS3MDL magnetometer
