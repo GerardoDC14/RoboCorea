@@ -248,10 +248,26 @@ void UrdfViewer::paintGL()
         }
     }
 
-    // Compute forward kinematics. In map mode the FK root starts at the robot's
-    // map->base pose so the model sits on the map; otherwise at the origin.
-    computeFKRecursive(root, map_mode_ ? base_transform_ : QMatrix4x4(),
-                       joints_snap, children);
+    // Choose the FK root transform:
+    //  • map mode → the robot's full map->base pose (set in pollBaseTransform);
+    //  • follow-orientation → rotate the base by the live IMU attitude (no
+    //    translation), reverting to upright if the data is stale/absent;
+    //  • otherwise → identity (the plain twin at the origin).
+    QMatrix4x4 root_tf;   // identity
+    if (map_mode_) {
+        root_tf = base_transform_;
+    } else if (follow_orient_) {
+        double qx, qy, qz, qw, t;
+        {
+            std::lock_guard<std::mutex> lk(orient_mutex_);
+            qx = orient_q_[0]; qy = orient_q_[1]; qz = orient_q_[2]; qw = orient_q_[3];
+            t = orient_time_s_;
+        }
+        if (node_->now().seconds() - t < 0.5)   // fresh attitude → follow it
+            root_tf.rotate(QQuaternion(static_cast<float>(qw), static_cast<float>(qx),
+                                       static_cast<float>(qy), static_cast<float>(qz)));
+    }
+    computeFKRecursive(root, root_tf, joints_snap, children);
 
     // Render links
     shader_->bind();
@@ -374,17 +390,20 @@ void UrdfViewer::buildFloorTexture()
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.width(), img.height(), 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, img.constBits());
 
-    // Quad covering the map rect at z=0, in the map frame. v=0 at the origin edge.
+    // Quad covering the map rect in the map frame, dropped to map_floor_z_ so it
+    // sits *under* the robot model (the URDF straddles z=0, so a floor exactly at
+    // z=0 cuts through the middle). Tune map_floor_z_ if it floats/clips.
+    const float z = map_floor_z_;
     const float x0 = ox, y0 = oy;
     const float x1 = ox + img.width() * res, y1 = oy + img.height() * res;
     const float quad[] = {
-        // pos                 uv
-        x0, y0, 0.0f,          0.0f, 0.0f,
-        x1, y0, 0.0f,          1.0f, 0.0f,
-        x1, y1, 0.0f,          1.0f, 1.0f,
-        x0, y0, 0.0f,          0.0f, 0.0f,
-        x1, y1, 0.0f,          1.0f, 1.0f,
-        x0, y1, 0.0f,          0.0f, 1.0f,
+        // pos                uv
+        x0, y0, z,            0.0f, 0.0f,
+        x1, y0, z,            1.0f, 0.0f,
+        x1, y1, z,            1.0f, 1.0f,
+        x0, y0, z,            0.0f, 0.0f,
+        x1, y1, z,            1.0f, 1.0f,
+        x0, y1, z,            0.0f, 1.0f,
     };
     floor_vertex_count_ = 6;
     if (floor_vao_ == 0) glGenVertexArrays(1, &floor_vao_);
@@ -398,6 +417,26 @@ void UrdfViewer::buildFloorTexture()
                           (void*)(3 * sizeof(float)));
     glEnableVertexAttribArray(1);
     glBindVertexArray(0);
+}
+
+void UrdfViewer::setFollowOrientation(bool on)
+{
+    follow_orient_ = on;
+    if (on && !orient_sub_) {
+        orient_sub_ = node_->create_subscription<sensor_msgs::msg::Imu>(
+            "/zed2/zed_node/imu/data", rclcpp::SensorDataQoS(),
+            [this](sensor_msgs::msg::Imu::SharedPtr m) { onOrientation(m); });
+    }
+}
+
+void UrdfViewer::onOrientation(const sensor_msgs::msg::Imu::SharedPtr msg)
+{
+    std::lock_guard<std::mutex> lk(orient_mutex_);
+    orient_q_[0] = msg->orientation.x;
+    orient_q_[1] = msg->orientation.y;
+    orient_q_[2] = msg->orientation.z;
+    orient_q_[3] = msg->orientation.w;
+    orient_time_s_ = node_->now().seconds();
 }
 
 void UrdfViewer::pollBaseTransform()
