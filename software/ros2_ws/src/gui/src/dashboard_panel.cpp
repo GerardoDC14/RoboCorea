@@ -204,7 +204,7 @@ DashboardPanel::DashboardPanel(rclcpp::Node::SharedPtr node, QWidget* parent)
     // not the ESP32. Exact topic depends on the ZED launch config; this is the
     // zed-ros2-wrapper default and stays blank until that node runs.
     imu_sub_ = node_->create_subscription<sensor_msgs::msg::Imu>(
-        "/zed2/zed_node/imu/data", sensor_qos,
+        "/zed/zed_node/imu/data", sensor_qos,   // namespace = camera_name (default 'zed')
         [this](sensor_msgs::msg::Imu::SharedPtr msg) {
             double qw = msg->orientation.w, qx = msg->orientation.x;
             double qy = msg->orientation.y, qz = msg->orientation.z;

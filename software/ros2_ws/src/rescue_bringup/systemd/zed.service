@@ -6,8 +6,10 @@ PartOf=rescue-sensors.target
 # Must match the workstation/GUI domain (and the other robot nodes).
 Environment=ROS_DOMAIN_ID=20
 # publish_tf:=false so the ZED never fights the robot_localization EKF for
-# odom->base_footprint. Adjust the workspace path / camera_model if yours differ.
-ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source %h/RoboCorea/software/ros2_ws/install/setup.bash && exec ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zed2 publish_tf:=false publish_map_tf:=false'
+# odom->base_footprint. camera_name:=zed pins the topic namespace to /zed/* so it
+# stays the same whatever the camera_model is (ZED1 vs ZED2 only changes the
+# model/calibration, not the topics). Set camera_model to match the real camera.
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source %h/RoboCorea/software/ros2_ws/install/setup.bash && exec ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zed2 camera_name:=zed publish_tf:=false publish_map_tf:=false'
 # Graceful SIGINT first; if the unit ever overruns the timeout the whole cgroup
 # is SIGKILLed. The ZED shuts down cleanly on SIGINT within this window, so no
 # manual ExecStopPost sweep is needed (a `pkill -f` sweep self-matches its own

@@ -440,10 +440,12 @@ void UrdfViewer::setFollowOrientation(bool on)
 {
     follow_orient_ = on;
     if (on && !orient_sub_) {
-        // Topic is overridable without a rebuild. /odometry/filtered + /odom/wheel
-        // are planar (yaw only); use /zed/zed_node/odom for full roll/pitch/yaw:
-        //   ros2 run gui gui --ros-args -p twin_odom_topic:=/zed/zed_node/odom
-        std::string topic = "/odometry/filtered";
+        // Default to the raw ZED VIO odom — full 6-DOF (roll/pitch/yaw) so the
+        // twin shows tilt/climb. The EKF /odometry/filtered + /odom/wheel are
+        // planar (yaw only). Overridable without a rebuild:
+        //   ros2 run gui gui --ros-args -p twin_odom_topic:=/odometry/filtered
+        // Namespace follows the ZED camera_name (default 'zed'), not the model.
+        std::string topic = "/zed/zed_node/odom";
         if (!node_->has_parameter("twin_odom_topic"))
             node_->declare_parameter("twin_odom_topic", topic);
         topic = node_->get_parameter("twin_odom_topic").as_string();
