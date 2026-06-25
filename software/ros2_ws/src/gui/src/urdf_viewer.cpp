@@ -64,6 +64,30 @@ void main() {
 }
 )";
 
+// Textured floor (occupancy grid) — map mode only.
+static const char* TEX_VERT = R"(
+#version 330 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec2 aUV;
+uniform mat4 view;
+uniform mat4 projection;
+out vec2 UV;
+void main() {
+    UV = aUV;
+    gl_Position = projection * view * vec4(aPos, 1.0);
+}
+)";
+
+static const char* TEX_FRAG = R"(
+#version 330 core
+in vec2 UV;
+uniform sampler2D tex;
+out vec4 FragColor;
+void main() {
+    FragColor = texture(tex, UV);
+}
+)";
+
 static std::string resolveUri(const std::string& uri)
 {
     if (uri.size() > 10 && uri.substr(0, 10) == "package://") {
@@ -107,7 +131,10 @@ UrdfViewer::~UrdfViewer()
     makeCurrent();
     cleanupGLResources();
     if (grid_vao_) { glDeleteVertexArrays(1, &grid_vao_); glDeleteBuffers(1, &grid_vbo_); }
+    if (floor_vao_) { glDeleteVertexArrays(1, &floor_vao_); glDeleteBuffers(1, &floor_vbo_); }
+    if (floor_tex_) glDeleteTextures(1, &floor_tex_);
     delete shader_;
+    delete tex_shader_;
     doneCurrent();
 }
 
@@ -125,6 +152,11 @@ void UrdfViewer::initializeGL()
     shader_->addShaderFromSourceCode(QOpenGLShader::Vertex, VERT_SHADER);
     shader_->addShaderFromSourceCode(QOpenGLShader::Fragment, FRAG_SHADER);
     shader_->link();
+
+    tex_shader_ = new QOpenGLShaderProgram(this);
+    tex_shader_->addShaderFromSourceCode(QOpenGLShader::Vertex, TEX_VERT);
+    tex_shader_->addShaderFromSourceCode(QOpenGLShader::Fragment, TEX_FRAG);
+    tex_shader_->link();
 
     createGrid();
 }
@@ -170,8 +202,28 @@ void UrdfViewer::paintGL()
     float aspect = width() > 0 ? float(width()) / height() : 1.0f;
     projection.perspective(45.0f, aspect, 0.01f, 100.0f);
 
-    // Draw grid
-    if (grid_vao_) {
+    // Map mode: refresh the robot's map pose + the floor texture, draw the floor.
+    if (map_mode_) {
+        pollBaseTransform();
+        buildFloorTexture();
+        if (floor_tex_ && floor_vao_ && floor_vertex_count_ > 0) {
+            glDisable(GL_BLEND);
+            tex_shader_->bind();
+            tex_shader_->setUniformValue("view", view);
+            tex_shader_->setUniformValue("projection", projection);
+            tex_shader_->setUniformValue("tex", 0);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, floor_tex_);
+            glBindVertexArray(floor_vao_);
+            glDrawArrays(GL_TRIANGLES, 0, floor_vertex_count_);
+            glBindVertexArray(0);
+            tex_shader_->release();
+            glEnable(GL_BLEND);
+        }
+    }
+
+    // Draw grid (twin mode, or map mode before a map has arrived)
+    if (grid_vao_ && (!map_mode_ || !have_map_)) {
         // Use a separate simple shader for grid — reuse main shader with identity model
         shader_->bind();
         QMatrix4x4 identity;
@@ -196,8 +248,10 @@ void UrdfViewer::paintGL()
         }
     }
 
-    // Compute forward kinematics
-    computeFKRecursive(root, QMatrix4x4(), joints_snap, children);
+    // Compute forward kinematics. In map mode the FK root starts at the robot's
+    // map->base pose so the model sits on the map; otherwise at the origin.
+    computeFKRecursive(root, map_mode_ ? base_transform_ : QMatrix4x4(),
+                       joints_snap, children);
 
     // Render links
     shader_->bind();
@@ -249,6 +303,124 @@ void UrdfViewer::wheelEvent(QWheelEvent* e)
     cam_distance_ *= (e->angleDelta().y() > 0) ? 0.9f : 1.1f;
     cam_distance_ = qBound(0.05f, cam_distance_, 50.0f);
     update();
+}
+
+// ── Map mode ─────────────────────────────────────────────────────────────────
+
+void UrdfViewer::setMapMode(bool on)
+{
+    map_mode_ = on;
+    if (on && !map_sub_) {
+        tf_buffer_ = std::make_unique<tf2_ros::Buffer>(node_->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+        auto qos = rclcpp::QoS(1).reliable().transient_local();
+        map_sub_ = node_->create_subscription<nav_msgs::msg::OccupancyGrid>(
+            "/map", qos,
+            [this](nav_msgs::msg::OccupancyGrid::SharedPtr m) { onMap(m); });
+        // A higher pitch + further camera reads better for a map-scale scene.
+        cam_pitch_ = 55.0f;
+        cam_distance_ = 6.0f;
+    }
+}
+
+void UrdfViewer::onMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
+{
+    const int w = static_cast<int>(msg->info.width);
+    const int h = static_cast<int>(msg->info.height);
+    if (w <= 0 || h <= 0) return;
+
+    // RGBA8888 keeps rows 4-byte aligned for glTexImage2D. Row 0 = grid row 0
+    // (map origin / lowest y); we map UV v=0 to that row so it lines up with the
+    // quad's -y edge at map origin.
+    QImage img(w, h, QImage::Format_RGBA8888);   // byte order R,G,B,A in memory
+    for (int row = 0; row < h; ++row) {
+        uchar* line = img.scanLine(row);
+        for (int col = 0; col < w; ++col) {
+            const int8_t v = msg->data[row * w + col];
+            uchar r, g, b;
+            if (v < 0)        { r = 70;  g = 70;  b = 80;  }   // unknown
+            else if (v >= 65) { r = 20;  g = 20;  b = 25;  }   // occupied
+            else              { r = 232; g = 232; b = 235; }   // free
+            uchar* px = line + col * 4;
+            px[0] = r; px[1] = g; px[2] = b; px[3] = 255;
+        }
+    }
+
+    std::lock_guard<std::mutex> lk(map_mutex_);
+    map_img_ = std::move(img);
+    map_res_ = msg->info.resolution;
+    map_ox_ = msg->info.origin.position.x;
+    map_oy_ = msg->info.origin.position.y;
+    map_dirty_ = true;
+    have_map_ = true;
+}
+
+void UrdfViewer::buildFloorTexture()
+{
+    QImage img; double res, ox, oy;
+    {
+        std::lock_guard<std::mutex> lk(map_mutex_);
+        if (!map_dirty_ || map_img_.isNull()) return;
+        img = map_img_; res = map_res_; ox = map_ox_; oy = map_oy_;
+        map_dirty_ = false;
+    }
+
+    if (floor_tex_ == 0) glGenTextures(1, &floor_tex_);
+    glBindTexture(GL_TEXTURE_2D, floor_tex_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.width(), img.height(), 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, img.constBits());
+
+    // Quad covering the map rect at z=0, in the map frame. v=0 at the origin edge.
+    const float x0 = ox, y0 = oy;
+    const float x1 = ox + img.width() * res, y1 = oy + img.height() * res;
+    const float quad[] = {
+        // pos                 uv
+        x0, y0, 0.0f,          0.0f, 0.0f,
+        x1, y0, 0.0f,          1.0f, 0.0f,
+        x1, y1, 0.0f,          1.0f, 1.0f,
+        x0, y0, 0.0f,          0.0f, 0.0f,
+        x1, y1, 0.0f,          1.0f, 1.0f,
+        x0, y1, 0.0f,          0.0f, 1.0f,
+    };
+    floor_vertex_count_ = 6;
+    if (floor_vao_ == 0) glGenVertexArrays(1, &floor_vao_);
+    if (floor_vbo_ == 0) glGenBuffers(1, &floor_vbo_);
+    glBindVertexArray(floor_vao_);
+    glBindBuffer(GL_ARRAY_BUFFER, floor_vbo_);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                          (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glBindVertexArray(0);
+}
+
+void UrdfViewer::pollBaseTransform()
+{
+    if (!tf_buffer_) return;
+    static const char* bases[] = {"base_footprint", "base_link"};
+    for (const char* bf : bases) {
+        try {
+            auto tf = tf_buffer_->lookupTransform("map", bf, tf2::TimePointZero);
+            const auto& t = tf.transform.translation;
+            const auto& q = tf.transform.rotation;
+            QMatrix4x4 m;
+            m.translate(static_cast<float>(t.x), static_cast<float>(t.y),
+                        static_cast<float>(t.z));
+            m.rotate(QQuaternion(static_cast<float>(q.w), static_cast<float>(q.x),
+                                 static_cast<float>(q.y), static_cast<float>(q.z)));
+            base_transform_ = m;
+            have_base_ = true;
+            return;
+        } catch (const tf2::TransformException&) {
+            // try the next candidate base frame
+        }
+    }
 }
 
 // ── URDF parsing (ROS thread) ───────────────────────────────────────────────

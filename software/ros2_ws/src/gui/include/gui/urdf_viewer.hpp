@@ -10,11 +10,17 @@
 #include <QWheelEvent>
 #include <QTimer>
 
+#include <QImage>
+
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <nav_msgs/msg/occupancy_grid.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -24,6 +30,11 @@ class UrdfViewer : public QOpenGLWidget, protected QOpenGLExtraFunctions {
 public:
     explicit UrdfViewer(rclcpp::Node::SharedPtr node, QWidget* parent = nullptr);
     ~UrdfViewer() override;
+
+    // Map mode: render the live /map (OccupancyGrid) as a textured floor and
+    // place the robot at its map->base_footprint pose (from TF), instead of the
+    // plain twin grid at the origin. Off by default (digital-twin behaviour).
+    void setMapMode(bool on);
 
 protected:
     void initializeGL() override;
@@ -96,6 +107,30 @@ private:
     void createGrid();
     GLuint grid_vao_{0}, grid_vbo_{0};
     int grid_vertex_count_{0};
+
+    // ── Map mode: textured occupancy-grid floor + base pose from TF ──────────
+    void onMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);  // ROS thread
+    void buildFloorTexture();   // GL thread: (re)upload the floor texture + quad
+    void pollBaseTransform();   // sets base_transform_ from map->base TF
+
+    bool map_mode_{false};
+    rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+
+    QOpenGLShaderProgram* tex_shader_{nullptr};
+    GLuint floor_tex_{0}, floor_vao_{0}, floor_vbo_{0};
+    int floor_vertex_count_{0};
+
+    std::mutex map_mutex_;
+    QImage map_img_;            // RGBA8888 render of the grid (row 0 = map origin)
+    double map_res_{0.05};
+    double map_ox_{0.0}, map_oy_{0.0};
+    bool map_dirty_{false};
+    bool have_map_{false};
+
+    QMatrix4x4 base_transform_; // map->base (identity until the first TF arrives)
+    bool have_base_{false};
 
     // ROS callbacks
     void onRobotDescription(const std_msgs::msg::String::SharedPtr msg);
