@@ -1,0 +1,17 @@
+[Unit]
+Description=RoboCorea SLAM + EKF (mapping_ekf: slam_toolbox + robot_localization)
+# On-demand, started by robot_manager after the sensor stack is up. SLAM/EKF run
+# HERE on the robot (close to the sensors); the workstation only visualizes /map
+# + TF over DDS. Depends on the raw ZED/lidar drivers (rescue-sensors.target)
+# already publishing /scan and /zed/zed_node/odom.
+
+[Service]
+# Must match the workstation/GUI domain.
+Environment=ROS_DOMAIN_ID=20
+# use_rviz:=false — the Jetson is headless; RViz runs on the workstation.
+# Adjust the workspace path if yours differs.
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source %h/RoboCorea/software/ros2_ws/install/setup.bash && exec ros2 launch rescue_nav mapping_ekf.launch.py use_rviz:=false'
+KillSignal=SIGINT
+KillMode=control-group
+TimeoutStopSec=15
+Restart=no

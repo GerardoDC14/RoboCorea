@@ -46,6 +46,7 @@ from std_srvs.srv import Trigger
 DEFAULT_STACKS = {
     'sensors': ('rescue-sensors.target', ['zed.service', 'lidar.service']),
     'i2c': ('jetson-sensors.service', ['jetson-sensors.service']),
+    'mapping': ('rescue-mapping.service', ['rescue-mapping.service']),
 }
 
 
@@ -62,7 +63,7 @@ class RobotManager(Node):
     def __init__(self):
         super().__init__('robot_manager')
 
-        self.declare_parameter('stacks', list(DEFAULT_STACKS.keys()))
+        self.declare_parameter('stacks', ['sensors', 'i2c', 'mapping'])
         self.declare_parameter('status_period', 1.0)
         names = list(self.get_parameter('stacks').value)
         period = float(self.get_parameter('status_period').value)
