@@ -6,7 +6,9 @@
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 
 static const char* VERT_SHADER = R"(
 #version 330 core
@@ -69,12 +71,13 @@ static const char* TEX_VERT = R"(
 #version 330 core
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec2 aUV;
+uniform mat4 model;
 uniform mat4 view;
 uniform mat4 projection;
 out vec2 UV;
 void main() {
     UV = aUV;
-    gl_Position = projection * view * vec4(aPos, 1.0);
+    gl_Position = projection * view * model * vec4(aPos, 1.0);
 }
 )";
 
@@ -202,24 +205,11 @@ void UrdfViewer::paintGL()
     float aspect = width() > 0 ? float(width()) / height() : 1.0f;
     projection.perspective(45.0f, aspect, 0.01f, 100.0f);
 
-    // Map mode: refresh the robot's map pose + the floor texture, draw the floor.
+    // Map mode: refresh the robot's map pose + the floor texture (the floor is
+    // drawn after FK, once we know the model's lowest point so it sits under it).
     if (map_mode_) {
         pollBaseTransform();
         buildFloorTexture();
-        if (floor_tex_ && floor_vao_ && floor_vertex_count_ > 0) {
-            glDisable(GL_BLEND);
-            tex_shader_->bind();
-            tex_shader_->setUniformValue("view", view);
-            tex_shader_->setUniformValue("projection", projection);
-            tex_shader_->setUniformValue("tex", 0);
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, floor_tex_);
-            glBindVertexArray(floor_vao_);
-            glDrawArrays(GL_TRIANGLES, 0, floor_vertex_count_);
-            glBindVertexArray(0);
-            tex_shader_->release();
-            glEnable(GL_BLEND);
-        }
     }
 
     // Draw grid (twin mode, or map mode before a map has arrived)
@@ -238,7 +228,12 @@ void UrdfViewer::paintGL()
         shader_->release();
     }
 
-    if (!parsed) return;
+    if (!parsed) {
+        // No URDF yet — still show the map floor (at the default z) so the map is
+        // visible before the model loads.
+        if (map_mode_ && have_map_) drawFloor(view, projection);
+        return;
+    }
 
     if (rebuild) {
         buildGLResources();
@@ -263,11 +258,35 @@ void UrdfViewer::paintGL()
             qx = orient_q_[0]; qy = orient_q_[1]; qz = orient_q_[2]; qw = orient_q_[3];
             t = orient_time_s_;
         }
-        if (node_->now().seconds() - t < 0.5)   // fresh attitude → follow it
+        const double n2 = qx * qx + qy * qy + qz * qz + qw * qw;
+        if (n2 > 0.5 && node_->now().seconds() - t < 0.5)   // valid + fresh → follow
             root_tf.rotate(QQuaternion(static_cast<float>(qw), static_cast<float>(qx),
                                        static_cast<float>(qy), static_cast<float>(qz)));
     }
     computeFKRecursive(root, root_tf, joints_snap, children);
+
+    // Map mode: place the floor just under the model's lowest world point (so the
+    // textured grid sits below the robot instead of cutting through it), then draw.
+    if (map_mode_ && have_map_) {
+        float min_z = std::numeric_limits<float>::max();
+        for (auto& [name, ld] : links_) {
+            for (auto& obj : ld.visuals) {
+                if (!obj.vao) continue;
+                QMatrix4x4 m = ld.world_transform * obj.visual_origin;
+                const QVector3D& a = obj.aabb_min;
+                const QVector3D& b = obj.aabb_max;
+                for (int i = 0; i < 8; ++i) {
+                    QVector3D c((i & 1) ? b.x() : a.x(),
+                                (i & 2) ? b.y() : a.y(),
+                                (i & 4) ? b.z() : a.z());
+                    min_z = std::min(min_z, m.map(c).z());
+                }
+            }
+        }
+        if (min_z < std::numeric_limits<float>::max())
+            map_floor_z_ = min_z - 0.01f;   // 1 cm clearance under the lowest point
+        drawFloor(view, projection);
+    }
 
     // Render links
     shader_->bind();
@@ -390,20 +409,18 @@ void UrdfViewer::buildFloorTexture()
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.width(), img.height(), 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, img.constBits());
 
-    // Quad covering the map rect in the map frame, dropped to map_floor_z_ so it
-    // sits *under* the robot model (the URDF straddles z=0, so a floor exactly at
-    // z=0 cuts through the middle). Tune map_floor_z_ if it floats/clips.
-    const float z = map_floor_z_;
+    // Quad covering the map rect in the map XY plane at local z=0; drawFloor()
+    // translates it down to map_floor_z_ (the model's lowest point) at draw time.
     const float x0 = ox, y0 = oy;
     const float x1 = ox + img.width() * res, y1 = oy + img.height() * res;
     const float quad[] = {
         // pos                uv
-        x0, y0, z,            0.0f, 0.0f,
-        x1, y0, z,            1.0f, 0.0f,
-        x1, y1, z,            1.0f, 1.0f,
-        x0, y0, z,            0.0f, 0.0f,
-        x1, y1, z,            1.0f, 1.0f,
-        x0, y1, z,            0.0f, 1.0f,
+        x0, y0, 0.0f,         0.0f, 0.0f,
+        x1, y0, 0.0f,         1.0f, 0.0f,
+        x1, y1, 0.0f,         1.0f, 1.0f,
+        x0, y0, 0.0f,         0.0f, 0.0f,
+        x1, y1, 0.0f,         1.0f, 1.0f,
+        x0, y1, 0.0f,         0.0f, 1.0f,
     };
     floor_vertex_count_ = 6;
     if (floor_vao_ == 0) glGenVertexArrays(1, &floor_vao_);
@@ -423,9 +440,18 @@ void UrdfViewer::setFollowOrientation(bool on)
 {
     follow_orient_ = on;
     if (on && !orient_sub_) {
+        // Topic is overridable so the zed/zed2 namespace can be corrected without
+        // a rebuild:  ros2 run gui gui --ros-args -p twin_imu_topic:=/zed/zed_node/imu/data
+        std::string topic = "/zed2/zed_node/imu/data";
+        if (!node_->has_parameter("twin_imu_topic"))
+            node_->declare_parameter("twin_imu_topic", topic);
+        topic = node_->get_parameter("twin_imu_topic").as_string();
         orient_sub_ = node_->create_subscription<sensor_msgs::msg::Imu>(
-            "/zed2/zed_node/imu/data", rclcpp::SensorDataQoS(),
+            topic, rclcpp::SensorDataQoS(),
             [this](sensor_msgs::msg::Imu::SharedPtr m) { onOrientation(m); });
+        RCLCPP_INFO(node_->get_logger(),
+                    "twin: following robot attitude from IMU '%s' "
+                    "(override with -p twin_imu_topic:=...)", topic.c_str());
     }
 }
 
@@ -437,6 +463,26 @@ void UrdfViewer::onOrientation(const sensor_msgs::msg::Imu::SharedPtr msg)
     orient_q_[2] = msg->orientation.z;
     orient_q_[3] = msg->orientation.w;
     orient_time_s_ = node_->now().seconds();
+}
+
+void UrdfViewer::drawFloor(const QMatrix4x4& view, const QMatrix4x4& projection)
+{
+    if (!(floor_tex_ && floor_vao_ && floor_vertex_count_ > 0)) return;
+    QMatrix4x4 model;
+    model.translate(0.0f, 0.0f, map_floor_z_);   // drop to the model's lowest point
+    glDisable(GL_BLEND);
+    tex_shader_->bind();
+    tex_shader_->setUniformValue("model", model);
+    tex_shader_->setUniformValue("view", view);
+    tex_shader_->setUniformValue("projection", projection);
+    tex_shader_->setUniformValue("tex", 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, floor_tex_);
+    glBindVertexArray(floor_vao_);
+    glDrawArrays(GL_TRIANGLES, 0, floor_vertex_count_);
+    glBindVertexArray(0);
+    tex_shader_->release();
+    glEnable(GL_BLEND);
 }
 
 void UrdfViewer::pollBaseTransform()
@@ -697,6 +743,24 @@ void UrdfViewer::computeFKRecursive(
 void UrdfViewer::uploadMesh(RenderObject& obj, const std::vector<Vertex>& verts)
 {
     obj.vertex_count = static_cast<int>(verts.size());
+
+    // Local-space bounding box — used in map mode to drop the floor under the
+    // model's lowest world point.
+    if (!verts.empty()) {
+        QVector3D mn(verts[0].pos[0], verts[0].pos[1], verts[0].pos[2]);
+        QVector3D mx = mn;
+        for (const auto& v : verts) {
+            mn.setX(std::min(mn.x(), v.pos[0]));
+            mn.setY(std::min(mn.y(), v.pos[1]));
+            mn.setZ(std::min(mn.z(), v.pos[2]));
+            mx.setX(std::max(mx.x(), v.pos[0]));
+            mx.setY(std::max(mx.y(), v.pos[1]));
+            mx.setZ(std::max(mx.z(), v.pos[2]));
+        }
+        obj.aabb_min = mn;
+        obj.aabb_max = mx;
+    }
+
     glGenVertexArrays(1, &obj.vao);
     glGenBuffers(1, &obj.vbo);
     glBindVertexArray(obj.vao);

@@ -74,6 +74,8 @@ private:
         int vertex_count{0};
         QVector4D color{0.7f, 0.7f, 0.7f, 1.0f};
         QMatrix4x4 visual_origin;
+        QVector3D aabb_min{0, 0, 0};   // local-space bounds (for map-floor height)
+        QVector3D aabb_max{0, 0, 0};
     };
 
     struct LinkData {
@@ -118,6 +120,7 @@ private:
     // ── Map mode: textured occupancy-grid floor + base pose from TF ──────────
     void onMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);  // ROS thread
     void buildFloorTexture();   // GL thread: (re)upload the floor texture + quad
+    void drawFloor(const QMatrix4x4& view, const QMatrix4x4& projection);
     void pollBaseTransform();   // sets base_transform_ from map->base TF
 
     bool map_mode_{false};
