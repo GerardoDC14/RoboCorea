@@ -64,7 +64,7 @@ class RobotManager(Node):
         super().__init__('robot_manager')
 
         self.declare_parameter('stacks', ['sensors', 'i2c', 'mapping'])
-        self.declare_parameter('status_period', 1.0)
+        self.declare_parameter('status_period', 0.5)   # 2 Hz: snappier GUI labels
         names = list(self.get_parameter('stacks').value)
         period = float(self.get_parameter('status_period').value)
 
@@ -101,6 +101,9 @@ class RobotManager(Node):
             self.get_logger().info(
                 f"stack '{name}' -> {unit} (members: {members})")
 
+        # Publish each stack's status right now (latched) so a GUI that connects
+        # later gets the state immediately instead of waiting for the first tick.
+        self._publish_all()
         self.create_timer(max(0.2, period), self._publish_all)
         self.get_logger().info(
             f"robot_manager ready — managing {len(self._stacks)} stack(s)")

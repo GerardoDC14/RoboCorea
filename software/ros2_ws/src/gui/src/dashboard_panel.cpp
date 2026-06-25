@@ -14,6 +14,17 @@
 
 #include <cmath>
 
+// Instant amber "pending" feedback on a stack's status LED+label the moment a
+// start/stop is clicked, so the UI responds immediately instead of waiting for
+// the status topic round-trip from the robot.
+static void setStackPending(QLabel* indicator, QLabel* label, const QString& text)
+{
+    if (!indicator || !label) return;
+    label->setText(text);
+    indicator->setStyleSheet("color: #ccaa00; font-size: 14px;");
+    label->setStyleSheet("color: #ccaa00; font-size: 12px;");
+}
+
 DashboardPanel::DashboardPanel(rclcpp::Node::SharedPtr node, QWidget* parent)
     : QWidget(parent), node_(node)
 {
@@ -789,6 +800,7 @@ void DashboardPanel::onSensorsStartClicked()
     }
     sensors_start_cli_->async_send_request(
         std::make_shared<std_srvs::srv::Trigger::Request>());
+    setStackPending(sensors_indicator_, sensors_label_, "activating…");
     RCLCPP_INFO(node_->get_logger(), "Sensors: start requested");
 }
 
@@ -802,6 +814,7 @@ void DashboardPanel::onSensorsStopClicked()
     }
     sensors_stop_cli_->async_send_request(
         std::make_shared<std_srvs::srv::Trigger::Request>());
+    setStackPending(sensors_indicator_, sensors_label_, "deactivating…");
     RCLCPP_INFO(node_->get_logger(), "Sensors: stop requested");
 }
 
@@ -834,6 +847,7 @@ void DashboardPanel::onI2cStartClicked()
         return;
     }
     i2c_start_cli_->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+    setStackPending(i2c_indicator_, i2c_label_, "activating…");
     RCLCPP_INFO(node_->get_logger(), "I2C sensors: start requested");
 }
 
@@ -846,6 +860,7 @@ void DashboardPanel::onI2cStopClicked()
         return;
     }
     i2c_stop_cli_->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+    setStackPending(i2c_indicator_, i2c_label_, "deactivating…");
     RCLCPP_INFO(node_->get_logger(), "I2C sensors: stop requested");
 }
 
@@ -880,6 +895,7 @@ void DashboardPanel::onMappingStartClicked()
         return;
     }
     mapping_start_cli_->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+    setStackPending(mapping_indicator_, mapping_label_, "activating…");
     RCLCPP_INFO(node_->get_logger(), "Mapping/SLAM: start requested");
 }
 
@@ -892,6 +908,7 @@ void DashboardPanel::onMappingStopClicked()
         return;
     }
     mapping_stop_cli_->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+    setStackPending(mapping_indicator_, mapping_label_, "deactivating…");
     RCLCPP_INFO(node_->get_logger(), "Mapping/SLAM: stop requested");
 }
 
