@@ -28,13 +28,26 @@ def generate_launch_description():
     cfg = os.path.join(
         get_package_share_directory('rescue_mapping3d'), 'config', 'octomap.yaml')
     base_link_z = LaunchConfiguration('base_link_z')
+    zed_frame = LaunchConfiguration('zed_mount_frame')
     return LaunchDescription([
         DeclareLaunchArgument('params_file', default_value=cfg),
         DeclareLaunchArgument('publish_base_link', default_value='true',
                               description='Publish a static base_footprint->base_link '
-                                          '(joins the ZED frames to the map tree).'),
+                                          '(joins base_link to the map tree).'),
         DeclareLaunchArgument('base_link_z', default_value='0.0',
                               description='base_link height above base_footprint (m).'),
+        # The ZED camera frames are their own tree on the Jetson (the robot URDF
+        # that mounts them is published by robot_state_publisher on the laptop).
+        # Publish the mount here so base_link reaches the ZED frames. Set the
+        # offsets to the real camera position on the robot; confirm the child
+        # frame name from `tf2_monitor` / the cloud's header.frame_id chain.
+        DeclareLaunchArgument('publish_zed_mount', default_value='true',
+                              description='Publish a static base_link->ZED-camera mount.'),
+        DeclareLaunchArgument('zed_mount_frame', default_value='zed_camera_link',
+                              description='ZED tree root frame to parent under base_link.'),
+        DeclareLaunchArgument('zed_mount_x', default_value='0.20'),
+        DeclareLaunchArgument('zed_mount_y', default_value='0.0'),
+        DeclareLaunchArgument('zed_mount_z', default_value='0.30'),
 
         Node(
             package='tf2_ros',
@@ -44,6 +57,18 @@ def generate_launch_description():
             condition=IfCondition(LaunchConfiguration('publish_base_link')),
             arguments=['--x', '0', '--y', '0', '--z', base_link_z,
                        '--frame-id', 'base_footprint', '--child-frame-id', 'base_link'],
+        ),
+
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='base_link_to_zed',
+            output='screen',
+            condition=IfCondition(LaunchConfiguration('publish_zed_mount')),
+            arguments=['--x', LaunchConfiguration('zed_mount_x'),
+                       '--y', LaunchConfiguration('zed_mount_y'),
+                       '--z', LaunchConfiguration('zed_mount_z'),
+                       '--frame-id', 'base_link', '--child-frame-id', zed_frame],
         ),
 
         Node(
