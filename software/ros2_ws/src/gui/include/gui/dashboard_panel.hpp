@@ -63,6 +63,8 @@ signals:
     void sensorsStatusUpdated(const QString& status);
     // I2C sensor stack lifecycle (thermal + magnetometer).
     void i2cStatusUpdated(const QString& status);
+    // Mapping/SLAM stack lifecycle (slam_toolbox + EKF on the Jetson).
+    void mappingStatusUpdated(const QString& status);
 
 public slots:
     // Called by VideoPanel when any widget selects/deselects the thermal source.
@@ -98,6 +100,11 @@ private slots:
     void onI2cStartClicked();
     void onI2cStopClicked();
     void onThermalToggled();
+    // Mapping/SLAM stack
+    void onMappingStatusUpdated(const QString& status);
+    void onMappingStartClicked();
+    void onMappingStopClicked();
+    void onOpenMapClicked();
 
 private:
     void setConnState(const QString& color, const QString& label);
@@ -199,4 +206,15 @@ private:
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr i2c_status_sub_;
     rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr i2c_start_cli_;
     rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr i2c_stop_cli_;
+
+    // ── Mapping/SLAM stack (slam_toolbox + EKF on the Jetson) ─────────────────
+    QLabel*      mapping_indicator_{nullptr};
+    QLabel*      mapping_label_{nullptr};
+    QPushButton* mapping_start_btn_{nullptr};
+    QPushButton* mapping_stop_btn_{nullptr};
+    QPushButton* open_map_btn_{nullptr};     // opens the local 2D map window
+    QWidget*     map_window_{nullptr};       // MapWindow (created lazily)
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr mapping_status_sub_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr mapping_start_cli_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr mapping_stop_cli_;
 };

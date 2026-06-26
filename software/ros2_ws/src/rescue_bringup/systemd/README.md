@@ -21,7 +21,8 @@ target and reports the state — so the GUI gets one-click control with no orpha
 | `lidar.service` | RPLidar driver on the stable `/dev/rplidar`. `PartOf` the target. |
 | `rescue-sensors.target` | Group: start/stop/restart it to control **both** drivers. |
 | `jetson-sensors.service` | I2C sensors (MLX90640 thermal + LIS3MDL mag), one process owning the shared bus. On-demand (no `[Install]`). |
-| `robot-manager.service` | Always-on node managing **stacks**: exposes `/robot/<stack>/{start,stop,restart}` + `/robot/<stack>/status` for `sensors` (ZED+lidar) and `i2c` (thermal+mag). |
+| `rescue-mapping.service` | SLAM + EKF (`mapping_ekf.launch.py`, `use_rviz:=false`) — runs on the robot; the workstation only views `/map` over DDS. On-demand; needs the sensor stack up. |
+| `robot-manager.service` | Always-on node managing **stacks**: exposes `/robot/<stack>/{start,stop,restart}` + `/robot/<stack>/status` for `sensors` (ZED+lidar), `i2c` (thermal+mag) and `mapping` (SLAM+EKF). |
 
 Before deploying, check the marked lines in each unit:
 - `Environment=ROS_DOMAIN_ID=20` — must match the workstation/GUI.

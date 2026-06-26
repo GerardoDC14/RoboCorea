@@ -18,6 +18,8 @@ find_package(std_srvs REQUIRED)                             # arm lifecycle Trig
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(tf2 REQUIRED)                                   # map window: robot pose
+find_package(tf2_ros REQUIRED)                              # map window: TF listener
 find_package(rescue_interfaces REQUIRED)                     # saved-pose services
 find_package(ament_index_cpp REQUIRED)
 find_package(urdf REQUIRED)                                  # digital twin: URDF parse
@@ -63,6 +65,7 @@ set(GUI_SOURCES
   src/arm_pose_panel.cpp
   src/settings_dialog.cpp
   src/ppm_calib_dialog.cpp
+  src/map_window.cpp
   src/filters.cpp
   # Headers listed so AUTOMOC processes the Q_OBJECT classes.
   include/gui/main_window.hpp
@@ -77,6 +80,7 @@ set(GUI_SOURCES
   include/gui/digital_twin_panel.hpp
   include/gui/settings_dialog.hpp
   include/gui/ppm_calib_dialog.hpp
+  include/gui/map_window.hpp
 )
 if(GST_FOUND)
   list(APPEND GUI_SOURCES src/gst_av_stream.cpp)
@@ -124,6 +128,8 @@ ament_target_dependencies(gui
   sensor_msgs
   geometry_msgs
   nav_msgs
+  tf2
+  tf2_ros
   rescue_interfaces
   urdf
   ament_index_cpp

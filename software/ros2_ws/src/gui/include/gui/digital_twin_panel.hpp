@@ -18,6 +18,7 @@ public:
         layout->setContentsMargins(0, 0, 0, 0);
         layout->setSpacing(2);
         viewer_ = new UrdfViewer(node, this);
+        viewer_->setFollowOrientation(true);        // base follows the robot's IMU attitude
         layout->addWidget(viewer_, 1);              // 3-D view takes the slack
         // Saved-pose controls below it; the grab callback feeds pose previews.
         pose_panel_ = new ArmPosePanel(

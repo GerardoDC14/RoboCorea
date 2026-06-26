@@ -1,6 +1,7 @@
 #include "gui/dashboard_panel.hpp"
 #include "gui/speech_processor.hpp"
 #include "gui/app_settings.hpp"
+#include "gui/map_window.hpp"
 
 #include <QFont>
 #include <QGraphicsOpacityEffect>
@@ -13,6 +14,17 @@
 #include <QVBoxLayout>
 
 #include <cmath>
+
+// Instant amber "pending" feedback on a stack's status LED+label the moment a
+// start/stop is clicked, so the UI responds immediately instead of waiting for
+// the status topic round-trip from the robot.
+static void setStackPending(QLabel* indicator, QLabel* label, const QString& text)
+{
+    if (!indicator || !label) return;
+    label->setText(text);
+    indicator->setStyleSheet("color: #ccaa00; font-size: 14px;");
+    label->setStyleSheet("color: #ccaa00; font-size: 12px;");
+}
 
 DashboardPanel::DashboardPanel(rclcpp::Node::SharedPtr node, QWidget* parent)
     : QWidget(parent), node_(node)
@@ -193,7 +205,7 @@ DashboardPanel::DashboardPanel(rclcpp::Node::SharedPtr node, QWidget* parent)
     // not the ESP32. Exact topic depends on the ZED launch config; this is the
     // zed-ros2-wrapper default and stays blank until that node runs.
     imu_sub_ = node_->create_subscription<sensor_msgs::msg::Imu>(
-        "/zed2/zed_node/imu/data", sensor_qos,
+        "/zed/zed_node/imu/data", sensor_qos,   // namespace = camera_name (default 'zed')
         [this](sensor_msgs::msg::Imu::SharedPtr msg) {
             double qw = msg->orientation.w, qx = msg->orientation.x;
             double qy = msg->orientation.y, qz = msg->orientation.z;
@@ -433,6 +445,50 @@ DashboardPanel::DashboardPanel(rclcpp::Node::SharedPtr node, QWidget* parent)
         layout->addLayout(en_row);
     }
 
+    // ── Mapping / SLAM (slam_toolbox + EKF on the Jetson; map viewed here) ─────
+    add_hsep();
+    {
+        auto* map_hdr_row = new QHBoxLayout();
+        auto* map_hdr = new QLabel("Mapping", this);
+        map_hdr->setStyleSheet(hdr_style);
+        mapping_indicator_ = new QLabel("●", this);
+        mapping_indicator_->setStyleSheet("color: #888; font-size: 14px;");
+        mapping_label_ = new QLabel("—", this);
+        mapping_label_->setStyleSheet("color: #888; font-size: 12px;");
+        map_hdr_row->addWidget(map_hdr);
+        map_hdr_row->addStretch();
+        map_hdr_row->addWidget(mapping_indicator_);
+        map_hdr_row->addWidget(mapping_label_);
+        layout->addLayout(map_hdr_row);
+
+        auto* map_btn_row = new QHBoxLayout();
+        map_btn_row->setSpacing(4);
+        mapping_start_btn_ = new QPushButton("Start SLAM", this);
+        mapping_start_btn_->setMinimumHeight(28);
+        mapping_start_btn_->setToolTip("Start slam_toolbox + EKF on the robot "
+                                       "(systemd rescue-mapping.service). Start the "
+                                       "sensors first.");
+        mapping_start_btn_->setStyleSheet(btn_style("#1a5a2a", "#2a7a3a", "#0a3a1a"));
+        connect(mapping_start_btn_, &QPushButton::clicked, this, &DashboardPanel::onMappingStartClicked);
+        map_btn_row->addWidget(mapping_start_btn_);
+
+        mapping_stop_btn_ = new QPushButton("Stop", this);
+        mapping_stop_btn_->setMinimumHeight(28);
+        mapping_stop_btn_->setToolTip("Cleanly stop SLAM + EKF on the robot");
+        mapping_stop_btn_->setStyleSheet(btn_style("#5a2a2a", "#7a3a3a", "#3a1a1a"));
+        connect(mapping_stop_btn_, &QPushButton::clicked, this, &DashboardPanel::onMappingStopClicked);
+        map_btn_row->addWidget(mapping_stop_btn_);
+
+        open_map_btn_ = new QPushButton("Open Map", this);
+        open_map_btn_->setMinimumHeight(28);
+        open_map_btn_->setToolTip("Open a live 2-D map window (subscribes /map + robot pose)");
+        open_map_btn_->setStyleSheet(btn_style("#2a4a7f", "#3a5a9f", "#1a3a6f"));
+        connect(open_map_btn_, &QPushButton::clicked, this, &DashboardPanel::onOpenMapClicked);
+        map_btn_row->addWidget(open_map_btn_);
+
+        layout->addLayout(map_btn_row);
+    }
+
     auto* btn_row = new QHBoxLayout();
     btn_row->setSpacing(4);
 
@@ -540,6 +596,17 @@ DashboardPanel::DashboardPanel(rclcpp::Node::SharedPtr node, QWidget* parent)
         });
     i2c_start_cli_ = node_->create_client<std_srvs::srv::Trigger>("/robot/i2c/start");
     i2c_stop_cli_  = node_->create_client<std_srvs::srv::Trigger>("/robot/i2c/stop");
+
+    // ── Mapping/SLAM stack (robot_manager 'mapping' stack on the Jetson) ─────
+    connect(this, &DashboardPanel::mappingStatusUpdated,
+            this, &DashboardPanel::onMappingStatusUpdated, Qt::QueuedConnection);
+    mapping_status_sub_ = node_->create_subscription<std_msgs::msg::String>(
+        "/robot/mapping/status", arm_qos,
+        [this](std_msgs::msg::String::SharedPtr msg) {
+            emit mappingStatusUpdated(QString::fromStdString(msg->data));
+        });
+    mapping_start_cli_ = node_->create_client<std_srvs::srv::Trigger>("/robot/mapping/start");
+    mapping_stop_cli_  = node_->create_client<std_srvs::srv::Trigger>("/robot/mapping/stop");
 }
 
 void DashboardPanel::setConnState(const QString& color, const QString& label)
@@ -791,6 +858,7 @@ void DashboardPanel::onSensorsStartClicked()
     }
     sensors_start_cli_->async_send_request(
         std::make_shared<std_srvs::srv::Trigger::Request>());
+    setStackPending(sensors_indicator_, sensors_label_, "activating…");
     RCLCPP_INFO(node_->get_logger(), "Sensors: start requested");
 }
 
@@ -804,6 +872,7 @@ void DashboardPanel::onSensorsStopClicked()
     }
     sensors_stop_cli_->async_send_request(
         std::make_shared<std_srvs::srv::Trigger::Request>());
+    setStackPending(sensors_indicator_, sensors_label_, "deactivating…");
     RCLCPP_INFO(node_->get_logger(), "Sensors: stop requested");
 }
 
@@ -836,6 +905,7 @@ void DashboardPanel::onI2cStartClicked()
         return;
     }
     i2c_start_cli_->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+    setStackPending(i2c_indicator_, i2c_label_, "activating…");
     RCLCPP_INFO(node_->get_logger(), "I2C sensors: start requested");
 }
 
@@ -848,6 +918,7 @@ void DashboardPanel::onI2cStopClicked()
         return;
     }
     i2c_stop_cli_->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+    setStackPending(i2c_indicator_, i2c_label_, "deactivating…");
     RCLCPP_INFO(node_->get_logger(), "I2C sensors: stop requested");
 }
 
@@ -870,4 +941,59 @@ void DashboardPanel::onI2cStatusUpdated(const QString& status)
     // The per-sensor enable toggles only do anything while the driver is running.
     thermal_toggle_->setEnabled(active);
     mag_toggle_->setEnabled(active);
+}
+
+// ── Mapping/SLAM stack (robot_manager 'mapping') ─────────────────────────────
+void DashboardPanel::onMappingStartClicked()
+{
+    if (!mapping_start_cli_->service_is_ready()) {
+        RCLCPP_WARN(node_->get_logger(),
+                    "Mapping start requested but the service is unavailable "
+                    "(is robot_manager running on the Jetson?)");
+        return;
+    }
+    mapping_start_cli_->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+    setStackPending(mapping_indicator_, mapping_label_, "activating…");
+    RCLCPP_INFO(node_->get_logger(), "Mapping/SLAM: start requested");
+}
+
+void DashboardPanel::onMappingStopClicked()
+{
+    if (!mapping_stop_cli_->service_is_ready()) {
+        RCLCPP_WARN(node_->get_logger(),
+                    "Mapping stop requested but the service is unavailable "
+                    "(is robot_manager running on the Jetson?)");
+        return;
+    }
+    mapping_stop_cli_->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+    setStackPending(mapping_indicator_, mapping_label_, "deactivating…");
+    RCLCPP_INFO(node_->get_logger(), "Mapping/SLAM: stop requested");
+}
+
+void DashboardPanel::onMappingStatusUpdated(const QString& status)
+{
+    mapping_label_->setText(status);
+    const QString s = status.section(' ', 0, 0);
+
+    QString color = "#888";
+    if (s == "active")           color = "#33cc33";
+    else if (s == "activating")  color = "#ccaa00";
+    else if (s == "partial")     color = "#ccaa00";
+    else if (s == "failed")      color = "#cc3333";
+    mapping_indicator_->setStyleSheet(QString("color: %1; font-size: 14px;").arg(color));
+    mapping_label_->setStyleSheet(QString("color: %1; font-size: 12px;").arg(color));
+
+    const bool active = (s == "active");
+    mapping_start_btn_->setEnabled(!active && s != "activating");
+    mapping_stop_btn_->setEnabled(s != "inactive");
+}
+
+void DashboardPanel::onOpenMapClicked()
+{
+    // Lazily create the standalone 2-D map window; just raise it if it exists.
+    if (!map_window_)
+        map_window_ = new MapWindow(node_);   // top-level (no parent) so it's its own window
+    map_window_->show();
+    map_window_->raise();
+    map_window_->activateWindow();
 }
